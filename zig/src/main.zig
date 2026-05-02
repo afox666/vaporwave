@@ -10,7 +10,9 @@ const baidu = @import("baidu.zig");
 const tencent = @import("tencent.zig");
 const duckdb = @import("duckdb.zig");
 const backtest = @import("backtest.zig");
+const http = @import("http_helpers.zig");
 const result_cache = @import("backtest_result_cache.zig");
+const sql_text = @import("sql_text.zig");
 const task_files = @import("backtest_task_files.zig");
 const sync = @import("sync.zig");
 
@@ -503,7 +505,7 @@ fn writeSchedulerStateFile(
     scheduled_for: ?[]const u8,
     message: ?[]const u8,
 ) !void {
-    const safe_message = try sqlEscape(allocator, message orelse "");
+    const safe_message = try sql_text.escape(allocator, message orelse "");
     defer allocator.free(safe_message);
 
     const content = try std.fmt.allocPrint(
@@ -940,7 +942,7 @@ fn markJobFinished(
     message: []const u8,
 ) !void {
     const safe_job_name = if (isSafeJobName(job_name)) job_name else return error.InvalidJobName;
-    const escaped = try sqlEscape(allocator, message);
+    const escaped = try sql_text.escape(allocator, message);
     defer allocator.free(escaped);
 
     const query = try std.fmt.allocPrint(allocator,
@@ -990,23 +992,6 @@ fn queryCount(allocator: std.mem.Allocator, db: *duckdb.Db, query: []const u8) !
 
     if (rows.rows.items.len == 0 or rows.rows.items[0].items.len == 0) return 0;
     return std.fmt.parseInt(usize, rows.rows.items[0].items[0], 10) catch 0;
-}
-
-fn sqlEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    errdefer out.deinit(allocator);
-
-    for (input) |ch| {
-        if (ch == '\'') {
-            try out.appendSlice(allocator, "''");
-        } else if (ch == '\n' or ch == '\r') {
-            try out.append(allocator, ' ');
-        } else {
-            try out.append(allocator, ch);
-        }
-    }
-
-    return try out.toOwnedSlice(allocator);
 }
 
 fn makeBacktestTaskId(allocator: std.mem.Allocator) ![]const u8 {
@@ -1388,7 +1373,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         if (header_len == null) {
             if (std.mem.indexOf(u8, request.items, "\r\n\r\n")) |idx| {
                 header_len = idx + 4;
-                body_len = parseContentLength(request.items[0..idx]);
+                body_len = http.parseContentLength(request.items[0..idx]);
             }
         }
 
@@ -1397,7 +1382,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         }
 
         if (request.items.len > 10 * 1024 * 1024) {
-            try respondError(allocator, stream, 500, "request too large");
+            try http.respondError(allocator, stream, 500, "request too large");
             return;
         }
     }
@@ -1429,7 +1414,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     if (!is_get and !is_post) {
         const ErrStruct = struct { err: []const u8 };
         const err_json = try std.json.Stringify.valueAlloc(allocator, ErrStruct{ .err = "Method not allowed" }, .{});
-        try respond(stream, 405, err_json);
+        try http.respond(stream, 405, err_json);
         return;
     }
 
@@ -1448,15 +1433,15 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         return;
     }
 
-    if (is_post and std.mem.startsWith(u8, uri, "/api/backtest/tasks/") and std.mem.endsWith(u8, stripQuery(uri), "/cancel")) {
-        const rest = stripQuery(uri)["/api/backtest/tasks/".len..];
+    if (is_post and std.mem.startsWith(u8, uri, "/api/backtest/tasks/") and std.mem.endsWith(u8, http.stripQuery(uri), "/cancel")) {
+        const rest = http.stripQuery(uri)["/api/backtest/tasks/".len..];
         const task_id = rest[0 .. rest.len - "/cancel".len];
         try handle_backtest_task_cancel(allocator, stream, task_id);
         return;
     }
 
     if (!is_get) {
-        try respondError(allocator, stream, 405, "method not allowed");
+        try http.respondError(allocator, stream, 405, "method not allowed");
         return;
     }
 
@@ -1469,7 +1454,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     // GET /api/stock/{symbol}/...
     if (std.mem.startsWith(u8, uri, "/api/stock/")) {
         const rest_with_query = uri["/api/stock/".len..];
-        const rest = stripQuery(rest_with_query);
+        const rest = http.stripQuery(rest_with_query);
 
         if (std.mem.endsWith(u8, rest, "/basic")) {
             try handle_stock_basic(allocator, stream, rest[0 .. rest.len - "/basic".len]);
@@ -1547,45 +1532,23 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         return;
     }
 
-    if (std.mem.eql(u8, stripQuery(uri), "/api/backtest/tasks")) {
+    if (std.mem.eql(u8, http.stripQuery(uri), "/api/backtest/tasks")) {
         try handle_backtest_task_list(allocator, stream, uri, db_path);
         return;
     }
 
     if (std.mem.startsWith(u8, uri, "/api/backtest/tasks/")) {
-        const task_id = stripQuery(uri)["/api/backtest/tasks/".len..];
+        const task_id = http.stripQuery(uri)["/api/backtest/tasks/".len..];
         try handle_backtest_task_get(allocator, stream, task_id, db_path);
         return;
     }
 
     if (std.mem.eql(u8, uri, "/api/health")) {
-        try respondJson(allocator, stream, 200, .{ .status = "ok" });
+        try http.respondJson(allocator, stream, 200, .{ .status = "ok" });
         return;
     }
 
-    try respondError(allocator, stream, 404, "Not found");
-}
-
-fn parseContentLength(headers: []const u8) usize {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    _ = lines.next();
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, ':')) |idx| {
-            const name = std.mem.trim(u8, line[0..idx], " \t");
-            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                const raw = std.mem.trim(u8, line[idx + 1 ..], " \t");
-                return std.fmt.parseInt(usize, raw, 10) catch 0;
-            }
-        }
-    }
-    return 0;
-}
-
-fn stripQuery(value: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, value, '?')) |idx| {
-        return value[0..idx];
-    }
-    return value;
+    try http.respondError(allocator, stream, 404, "Not found");
 }
 
 fn handle_backtest_task_create(
@@ -1596,19 +1559,19 @@ fn handle_backtest_task_create(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respondError(allocator, stream, 500, "database path is missing");
+        try http.respondError(allocator, stream, 500, "database path is missing");
         return;
     };
     backtest.validateRequest(allocator, body) catch |err| {
         std.debug.print("Backtest task validation error: {any}\n", .{err});
-        try respondError(allocator, stream, 400, "invalid backtest request");
+        try http.respondError(allocator, stream, 400, "invalid backtest request");
         return;
     };
 
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
     const cache_key = result_cache.makeKey(allocator, body, db) catch |err| {
         std.debug.print("Backtest cache key error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "failed to build backtest cache key");
+        try http.respondError(allocator, stream, 500, "failed to build backtest cache key");
         return;
     };
     defer allocator.free(cache_key);
@@ -1620,7 +1583,7 @@ fn handle_backtest_task_create(
         if (backtest_task_store.findActiveByCacheKeyLocked(cache_key)) |active| {
             const body_json = try renderBacktestTaskJsonLocked(allocator, active);
             defer allocator.free(body_json);
-            try respond(stream, 200, body_json);
+            try http.respond(stream, 200, body_json);
             return;
         }
     }
@@ -1629,7 +1592,7 @@ fn handle_backtest_task_create(
     const task = backtest_task_store.create(body, path, cache_key, cached_result) catch |err| {
         if (cached_result) |cached| allocator.free(cached);
         std.debug.print("Backtest task create error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "failed to create backtest task");
+        try http.respondError(allocator, stream, 500, "failed to create backtest task");
         return;
     };
 
@@ -1641,7 +1604,7 @@ fn handle_backtest_task_create(
             setBacktestTaskFailed(task, "failed to enqueue backtest task");
             const body_json = try renderBacktestTaskJsonLockedAfterLookup(allocator, task.id);
             defer allocator.free(body_json);
-            try respond(stream, 200, body_json);
+            try http.respond(stream, 200, body_json);
             return;
         };
         backtest_task_store.mutex.unlock();
@@ -1650,7 +1613,7 @@ fn handle_backtest_task_create(
 
     const body_json = try renderBacktestTaskJsonLockedAfterLookup(allocator, task.id);
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn renderBacktestTaskJsonLockedAfterLookup(allocator: std.mem.Allocator, task_id: []const u8) ![]u8 {
@@ -1668,22 +1631,22 @@ fn handle_backtest_task_get(
     db_path: ?[]const u8,
 ) !void {
     if (task_id.len == 0) {
-        try respondError(allocator, stream, 404, "backtest task not found");
+        try http.respondError(allocator, stream, 404, "backtest task not found");
         return;
     }
     const body_json = (try renderBacktestTaskJson(allocator, task_id)) orelse blk: {
         const path = db_path orelse {
-            try respondError(allocator, stream, 404, "backtest task not found");
+            try http.respondError(allocator, stream, 404, "backtest task not found");
             return;
         };
         const workspace_dir = std.fs.path.dirname(path) orelse ".";
         break :blk (try task_files.loadJson(allocator, workspace_dir, task_id, backtest_task_store.running_count, MAX_CONCURRENT_BACKTEST_TASKS)) orelse {
-            try respondError(allocator, stream, 404, "backtest task not found");
+            try http.respondError(allocator, stream, 404, "backtest task not found");
             return;
         };
     };
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn handle_backtest_task_list(
@@ -1693,14 +1656,14 @@ fn handle_backtest_task_list(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respondError(allocator, stream, 500, "database path is missing");
+        try http.respondError(allocator, stream, 500, "database path is missing");
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
     const limit = parsePositiveQueryInt(uri, "limit", 10, 50);
     const body_json = try listBacktestTasksJson(allocator, workspace_dir, limit);
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn handle_backtest_task_cancel(
@@ -1709,15 +1672,15 @@ fn handle_backtest_task_cancel(
     task_id: []const u8,
 ) !void {
     if (task_id.len == 0) {
-        try respondError(allocator, stream, 404, "backtest task not found");
+        try http.respondError(allocator, stream, 404, "backtest task not found");
         return;
     }
     const body_json = (try cancelBacktestTaskJson(allocator, task_id)) orelse {
-        try respondError(allocator, stream, 404, "backtest task not found");
+        try http.respondError(allocator, stream, 404, "backtest task not found");
         return;
     };
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn handle_backtest(
@@ -1728,11 +1691,11 @@ fn handle_backtest(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respondError(allocator, stream, 500, "database path is missing");
+        try http.respondError(allocator, stream, 500, "database path is missing");
         return;
     };
     const d = db orelse {
-        try respondError(allocator, stream, 500, "database is not available");
+        try http.respondError(allocator, stream, 500, "database is not available");
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
@@ -1741,20 +1704,20 @@ fn handle_backtest(
     if (cache_key) |key| {
         if (result_cache.load(allocator, workspace_dir, key) catch null) |cached| {
             defer allocator.free(cached);
-            try respond(stream, 200, cached);
+            try http.respond(stream, 200, cached);
             return;
         }
     }
     const result = backtest.run(allocator, d, body, workspace_dir) catch |err| {
         std.debug.print("Backtest error: {any}\n", .{err});
-        try respondError(allocator, stream, 400, "backtest failed");
+        try http.respondError(allocator, stream, 400, "backtest failed");
         return;
     };
     defer allocator.free(result);
     if (cache_key) |key| {
         result_cache.save(allocator, workspace_dir, key, result);
     }
-    try respond(stream, 200, result);
+    try http.respond(stream, 200, result);
 }
 
 fn handle_backtest_history(
@@ -1763,17 +1726,17 @@ fn handle_backtest_history(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
     const result = backtest.history(allocator, workspace_dir) catch |err| {
         std.debug.print("Backtest history error: {any}\n", .{err});
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     defer allocator.free(result);
-    try respond(stream, 200, result);
+    try http.respond(stream, 200, result);
 }
 
 // ============================================================
@@ -1784,7 +1747,7 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
         std.debug.print("EastMoney error: {any}, trying Tencent\n", .{err});
         var t_info = tencent.getStockInfo(allocator, symbol) catch |err2| {
             std.debug.print("Tencent error: {any}\n", .{err2});
-            try respondError(allocator, stream, 500, "no data");
+            try http.respondError(allocator, stream, 500, "no data");
             return;
         };
         defer t_info.deinit(allocator);
@@ -1817,13 +1780,13 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
         try s.objectField("流通股");
         try writeNullableF64(&s, t_info.float_shares);
         try s.endObject();
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     };
     defer info.deinit(allocator);
 
     if (info.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -1858,7 +1821,7 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
     try s.objectField("上市时间");
     try s.write(info.list_date orelse "");
     try s.endObject();
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -1867,13 +1830,13 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
 fn handle_search(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8) !void {
     const q_str = if (std.mem.indexOf(u8, uri, "?q=")) |idx| uri[idx + 3 ..] else "";
     if (q_str.len == 0) {
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     }
 
     var result = eastmoney.searchStock(allocator, q_str) catch |err| {
         std.debug.print("Search error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "search failed");
+        try http.respondError(allocator, stream, 500, "search failed");
         return;
     };
     defer result.deinit(allocator);
@@ -1893,7 +1856,7 @@ fn handle_search(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []co
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -1904,7 +1867,7 @@ fn handle_stock_kline(allocator: std.mem.Allocator, stream: std.net.Stream, symb
     defer result.deinit(allocator);
 
     if (result.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -1931,25 +1894,12 @@ fn handle_stock_kline(allocator: std.mem.Allocator, stream: std.net.Stream, symb
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
 // Daily K-line with amount and change_pct
 // ============================================================
-fn queryParam(uri: []const u8, name: []const u8) ?[]const u8 {
-    const query_start = std.mem.indexOfScalar(u8, uri, '?') orelse return null;
-    const query = uri[query_start + 1 ..];
-    var iter = std.mem.splitScalar(u8, query, '&');
-    while (iter.next()) |part| {
-        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-        if (std.mem.eql(u8, part[0..eq], name)) {
-            return part[eq + 1 ..];
-        }
-    }
-    return null;
-}
-
 fn isSafeDate(s: []const u8) bool {
     if (s.len != 10) return false;
     for (s, 0..) |ch, idx| {
@@ -2647,8 +2597,8 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const start_date = queryParam(uri, "start_date");
-    const end_date = queryParam(uri, "end_date");
+    const start_date = http.queryParam(uri, "start_date");
+    const end_date = http.queryParam(uri, "end_date");
 
     var query = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
     defer query.deinit(aa);
@@ -2718,12 +2668,12 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
     return true;
 }
 
 fn parsePositiveQueryInt(uri: []const u8, name: []const u8, default_value: usize, max_value: usize) usize {
-    const raw = queryParam(uri, name) orelse return default_value;
+    const raw = http.queryParam(uri, name) orelse return default_value;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return default_value;
     if (parsed == 0) return default_value;
     return @min(parsed, max_value);
@@ -2757,14 +2707,14 @@ fn writeDailyBarsArray(stream: std.net.Stream, allocator: std.mem.Allocator, bar
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 fn handle_price_history(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: []const u8, uri: []const u8, db: ?*duckdb.Db) !void {
     const days = parsePositiveQueryInt(uri, "days", 30, 5000);
     const bars = loadDailyBars(allocator, db, symbol, days) catch |err| {
         std.debug.print("Price history error: {any}\n", .{err});
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     defer freeDailyBars(allocator, bars);
@@ -2787,13 +2737,13 @@ fn handle_daily_k(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: 
 
     var result = eastmoney.getDailyK(allocator, symbol, if (days > 0) days else 500) catch |err| {
         std.debug.print("Daily K error: {any}\n", .{err});
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     defer result.deinit(allocator);
 
     if (result.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -2824,7 +2774,7 @@ fn handle_daily_k(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: 
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -2835,7 +2785,7 @@ fn handle_stock_valuation(allocator: std.mem.Allocator, stream: std.net.Stream, 
     defer result.deinit(allocator);
 
     if (result.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -2863,7 +2813,7 @@ fn handle_stock_valuation(allocator: std.mem.Allocator, stream: std.net.Stream, 
     try s.endArray();
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3109,7 +3059,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const raw_industry = queryParam(uri, "industry") orelse "";
+    const raw_industry = http.queryParam(uri, "industry") orelse "";
     const decoded_industry = if (raw_industry.len > 0) eastmoney.urlDecode(aa, raw_industry) catch raw_industry else "";
 
     var industry_name: []const u8 = decoded_industry;
@@ -3146,7 +3096,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
             try s.beginArray();
             try s.endArray();
             try s.endObject();
-            try respond(stream, 200, out.written());
+            try http.respond(stream, 200, out.written());
             return;
         };
         defer industry.deinit(allocator);
@@ -3210,7 +3160,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
         try s.endArray();
         try s.endObject();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     }
 
@@ -3244,7 +3194,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
     try s.endArray();
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3256,7 +3206,7 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
         std.debug.print("EastMoney error: {any}, trying Tencent\n", .{err});
         var t_info = tencent.getStockInfo(allocator, symbol) catch |err2| {
             std.debug.print("Tencent error: {any}\n", .{err2});
-            try respondJson(allocator, stream, 200, .{ .symbol = symbol });
+            try http.respondJson(allocator, stream, 200, .{ .symbol = symbol });
             return;
         };
         defer t_info.deinit(allocator);
@@ -3312,7 +3262,7 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
         try s.endArray();
         try s.endObject();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     };
     defer info.deinit(allocator);
@@ -3402,7 +3352,7 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
 
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3420,7 +3370,7 @@ fn handle_stock_profile(allocator: std.mem.Allocator, stream: std.net.Stream, sy
             defer out.deinit();
             var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
             try writeProfileObject(&s, symbol, symbol, "", "", profile);
-            try respond(stream, 200, out.written());
+            try http.respond(stream, 200, out.written());
             return;
         };
         defer t_info.deinit(allocator);
@@ -3429,7 +3379,7 @@ fn handle_stock_profile(allocator: std.mem.Allocator, stream: std.net.Stream, sy
         defer out.deinit();
         var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
         try writeProfileObject(&s, t_info.symbol, t_info.name, "", "", profile);
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     };
     defer info.deinit(allocator);
@@ -3438,7 +3388,7 @@ fn handle_stock_profile(allocator: std.mem.Allocator, stream: std.net.Stream, sy
     defer out.deinit();
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
     try writeProfileObject(&s, info.symbol, info.name, info.industry orelse "", info.list_date orelse "", profile);
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3478,7 +3428,7 @@ fn handle_stock_technical(allocator: std.mem.Allocator, stream: std.net.Stream, 
     defer out.deinit();
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
     try writeTechnicalObject(&s, technical);
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3489,14 +3439,14 @@ fn handle_futures(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []c
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const raw_industry = queryParam(uri, "industry") orelse "";
+    const raw_industry = http.queryParam(uri, "industry") orelse "";
     const industry_name = if (raw_industry.len > 0) eastmoney.urlDecode(aa, raw_industry) catch raw_industry else "";
 
     var out = std.io.Writer.Allocating.init(allocator);
     defer out.deinit();
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
     try writeFuturesAnalysisObject(&s, allocator, industry_name);
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3786,7 +3736,7 @@ fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []cons
 
     var scan = runMarketScan(allocator, db, top_n) catch |err| {
         std.debug.print("Scan error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "scan failed");
+        try http.respondError(allocator, stream, 500, "scan failed");
         return;
     };
     defer scan.deinit(allocator);
@@ -3843,7 +3793,7 @@ fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []cons
     try s.write(scan.coverage_count);
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 fn saveScanToDb(
@@ -3874,8 +3824,8 @@ fn saveScanToDb(
     var i: usize = 0;
     while (i < items.len) : (i += 1) {
         const rank = i + 1;
-        const escaped_name = try sqlEscape(aa, items[i].name);
-        const escaped_industry = try sqlEscape(aa, items[i].industry);
+        const escaped_name = try sql_text.escape(aa, items[i].name);
+        const escaped_industry = try sql_text.escape(aa, items[i].industry);
 
         const insert_stock = try std.fmt.allocPrint(
             aa,
@@ -3893,7 +3843,7 @@ fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db:
     if (db) |d| {
         var result = d.queryRows(allocator, "SELECT CAST(scan_date AS VARCHAR) AS scan_date, top_n, total_stocks, CAST(created_at AS VARCHAR) as created_at FROM scan_result ORDER BY scan_date DESC LIMIT 100") catch |err| {
             std.debug.print("DuckDB query error: {any}\n", .{err});
-            try respond(stream, 200, "[]");
+            try http.respond(stream, 200, "[]");
             return;
         };
         defer result.deinit(allocator);
@@ -3918,9 +3868,9 @@ fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db:
         }
         try s.endArray();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
     } else {
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
     }
 }
 
@@ -3941,7 +3891,7 @@ fn handle_scan_history_detail(allocator: std.mem.Allocator, stream: std.net.Stre
 
         var result = d.queryRows(allocator, query) catch |err| {
             std.debug.print("DuckDB query error: {any}\n", .{err});
-            try respond(stream, 200, "{\"stocks\":[]}");
+            try http.respond(stream, 200, "{\"stocks\":[]}");
             return;
         };
         defer result.deinit(allocator);
@@ -3977,9 +3927,9 @@ fn handle_scan_history_detail(allocator: std.mem.Allocator, stream: std.net.Stre
         try s.endArray();
         try s.endObject();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
     } else {
-        try respond(stream, 200, "{\"stocks\":[]}");
+        try http.respond(stream, 200, "{\"stocks\":[]}");
     }
 }
 
@@ -3997,43 +3947,5 @@ fn handle_factors(stream: std.net.Stream) !void {
         \\{"name":"ma_deviation_20","category":"technical","description":"价格偏离MA20百分比","higher_is_better":true}
         \\]
     ;
-    try respond(stream, 200, body);
-}
-
-// ============================================================
-// Response helpers
-// ============================================================
-fn respondJson(allocator: std.mem.Allocator, stream: std.net.Stream, status: u16, value: anytype) !void {
-    const body = try std.json.Stringify.valueAlloc(allocator, value, .{});
-    defer allocator.free(body);
-    try respond(stream, status, body);
-}
-
-fn respondError(allocator: std.mem.Allocator, stream: std.net.Stream, status: u16, msg: []const u8) !void {
-    const E = struct { err: []const u8 };
-    const body = try std.json.Stringify.valueAlloc(allocator, E{ .err = msg }, .{});
-    defer allocator.free(body);
-    try respond(stream, status, body);
-}
-
-fn respond(stream: std.net.Stream, status: u16, body: []const u8) !void {
-    const status_text = switch (status) {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        501 => "Not Implemented",
-        500 => "Internal Server Error",
-        else => "Unknown",
-    };
-
-    var header_buf: [512]u8 = undefined;
-    const header = try std.fmt.bufPrint(
-        &header_buf,
-        "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-        .{ status, status_text, body.len },
-    );
-
-    try stream.writeAll(header);
-    try stream.writeAll(body);
+    try http.respond(stream, 200, body);
 }

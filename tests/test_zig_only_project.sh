@@ -49,9 +49,14 @@ script="$(< tauri-client.sh)"
 
 for module in \
   zig/src/backtest_config.zig \
+  zig/src/backtest_factor_cache.zig \
+  zig/src/backtest_factors.zig \
   zig/src/backtest_hooks.zig \
   zig/src/backtest_result_cache.zig \
-  zig/src/backtest_task_files.zig
+  zig/src/backtest_task_files.zig \
+  zig/src/backtest_types.zig \
+  zig/src/http_helpers.zig \
+  zig/src/sql_text.zig
 do
   [[ -f "$module" ]] || fail "missing split Zig module: $module"
 done
@@ -60,9 +65,14 @@ backtest_source="$(< zig/src/backtest.zig)"
 main_source="$(< zig/src/main.zig)"
 
 [[ "$backtest_source" == *'@import("backtest_config.zig")'* ]] || fail "backtest.zig does not import backtest_config.zig"
+[[ "$backtest_source" == *'@import("backtest_factor_cache.zig")'* ]] || fail "backtest.zig does not import backtest_factor_cache.zig"
+[[ "$backtest_source" == *'@import("backtest_factors.zig")'* ]] || fail "backtest.zig does not import backtest_factors.zig"
 [[ "$backtest_source" == *'@import("backtest_hooks.zig")'* ]] || fail "backtest.zig does not import backtest_hooks.zig"
+[[ "$backtest_source" == *'@import("backtest_types.zig")'* ]] || fail "backtest.zig does not import backtest_types.zig"
+[[ "$main_source" == *'@import("http_helpers.zig")'* ]] || fail "main.zig does not import http_helpers.zig"
 [[ "$main_source" == *'@import("backtest_result_cache.zig")'* ]] || fail "main.zig does not import backtest_result_cache.zig"
 [[ "$main_source" == *'@import("backtest_task_files.zig")'* ]] || fail "main.zig does not import backtest_task_files.zig"
+[[ "$main_source" == *'@import("sql_text.zig")'* ]] || fail "main.zig does not import sql_text.zig"
 
 (
   cd zig
