@@ -10,11 +10,12 @@ const baidu = @import("baidu.zig");
 const tencent = @import("tencent.zig");
 const duckdb = @import("duckdb.zig");
 const backtest = @import("backtest.zig");
+const result_cache = @import("backtest_result_cache.zig");
+const task_files = @import("backtest_task_files.zig");
 const sync = @import("sync.zig");
 
 const MAX_BACKTEST_TASKS = 50;
 const MAX_CONCURRENT_BACKTEST_TASKS = 1;
-const RESULT_CACHE_VERSION = "zig-result-v1";
 
 const BacktestTaskStatus = enum {
     queued,
@@ -1017,230 +1018,6 @@ fn makeBacktestTaskId(allocator: std.mem.Allocator) ![]const u8 {
     return out;
 }
 
-fn sha256Hex(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(input, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const out = try allocator.alloc(u8, 24);
-    @memcpy(out, hex[0..24]);
-    return out;
-}
-
-fn queryBacktestDataFingerprint(allocator: std.mem.Allocator, db: ?*duckdb.Db) ![]const u8 {
-    const d = db orelse return try allocator.dupe(u8, "daily_k:no-db");
-    var rows = d.queryRows(
-        allocator,
-        "SELECT COUNT(*) AS cnt, COALESCE(CAST(MAX(date) AS VARCHAR), '') AS max_date, COALESCE(CAST(MAX(updated_at) AS VARCHAR), '') AS max_updated FROM daily_k",
-    ) catch {
-        return try allocator.dupe(u8, "daily_k:unknown");
-    };
-    defer rows.deinit(allocator);
-    const cnt = rows.getStr(0, "cnt") orelse "0";
-    const max_date = rows.getStr(0, "max_date") orelse "";
-    const max_updated = rows.getStr(0, "max_updated") orelse "";
-    return std.fmt.allocPrint(allocator, "daily_k:{s}:{s}:{s}", .{ cnt, max_date, max_updated });
-}
-
-fn makeBacktestResultCacheKey(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    db: ?*duckdb.Db,
-) ![]const u8 {
-    const fingerprint = try queryBacktestDataFingerprint(allocator, db);
-    defer allocator.free(fingerprint);
-    var raw = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    defer raw.deinit(allocator);
-    try raw.appendSlice(allocator, RESULT_CACHE_VERSION);
-    try raw.append(allocator, '\n');
-    try raw.appendSlice(allocator, fingerprint);
-    try raw.append(allocator, '\n');
-    try raw.appendSlice(allocator, std.mem.trim(u8, body, " \t\r\n"));
-    return sha256Hex(allocator, raw.items);
-}
-
-fn backtestResultCacheDir(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_result_cache/zig", .{workspace_dir});
-}
-
-fn backtestResultCachePath(allocator: std.mem.Allocator, workspace_dir: []const u8, cache_key: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_result_cache/zig/{s}.json", .{ workspace_dir, cache_key });
-}
-
-fn loadBacktestResultCache(allocator: std.mem.Allocator, workspace_dir: []const u8, cache_key: []const u8) !?[]u8 {
-    const path = try backtestResultCachePath(allocator, workspace_dir, cache_key);
-    defer allocator.free(path);
-    return std.fs.cwd().readFileAlloc(allocator, path, 20 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => null,
-    };
-}
-
-fn saveBacktestResultCache(allocator: std.mem.Allocator, workspace_dir: []const u8, cache_key: []const u8, result: []const u8) void {
-    const dir = backtestResultCacheDir(allocator, workspace_dir) catch return;
-    defer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch |err| {
-        std.debug.print("Backtest result cache mkdir failed: {any}\n", .{err});
-        return;
-    };
-    const path = backtestResultCachePath(allocator, workspace_dir, cache_key) catch return;
-    defer allocator.free(path);
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
-    defer allocator.free(tmp_path);
-    std.fs.cwd().writeFile(.{ .sub_path = tmp_path, .data = result }) catch |err| {
-        std.debug.print("Backtest result cache write failed: {any}\n", .{err});
-        return;
-    };
-    std.fs.cwd().rename(tmp_path, path) catch |err| {
-        std.debug.print("Backtest result cache rename failed: {any}\n", .{err});
-    };
-}
-
-const PersistedBacktestTaskFile = struct {
-    name: []const u8,
-    mtime: i128,
-};
-
-fn persistedBacktestTaskFileNewer(_: void, a: PersistedBacktestTaskFile, b: PersistedBacktestTaskFile) bool {
-    return a.mtime > b.mtime;
-}
-
-fn backtestTaskStoreDir(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_tasks/zig", .{workspace_dir});
-}
-
-fn backtestTaskStorePath(allocator: std.mem.Allocator, workspace_dir: []const u8, task_id: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_tasks/zig/{s}.json", .{ workspace_dir, task_id });
-}
-
-fn writePersistedBacktestTaskJson(
-    allocator: std.mem.Allocator,
-    workspace_dir: []const u8,
-    task_id: []const u8,
-    body: []const u8,
-) void {
-    const dir = backtestTaskStoreDir(allocator, workspace_dir) catch return;
-    defer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch |err| {
-        std.debug.print("Backtest task store mkdir failed: {any}\n", .{err});
-        return;
-    };
-
-    const path = backtestTaskStorePath(allocator, workspace_dir, task_id) catch return;
-    defer allocator.free(path);
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
-    defer allocator.free(tmp_path);
-
-    std.fs.cwd().writeFile(.{ .sub_path = tmp_path, .data = body }) catch |err| {
-        std.debug.print("Backtest task store write failed: {any}\n", .{err});
-        return;
-    };
-    std.fs.cwd().rename(tmp_path, path) catch |err| {
-        std.debug.print("Backtest task store rename failed: {any}\n", .{err});
-    };
-}
-
-fn jsonStringField(json: []const u8, field: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, json, search_from, field)) |idx| {
-        search_from = idx + field.len;
-        if (idx == 0 or json[idx - 1] != '"') continue;
-        if (idx + field.len >= json.len or json[idx + field.len] != '"') continue;
-
-        var pos = idx + field.len + 1;
-        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) : (pos += 1) {}
-        if (pos >= json.len or json[pos] != ':') continue;
-        pos += 1;
-        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) : (pos += 1) {}
-        if (pos >= json.len or json[pos] != '"') continue;
-        pos += 1;
-
-        const value_start = pos;
-        var escaped = false;
-        while (pos < json.len) : (pos += 1) {
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (json[pos] == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (json[pos] == '"') return json[value_start..pos];
-        }
-    }
-    return null;
-}
-
-fn persistedTaskJsonIsNonTerminal(raw: []const u8) bool {
-    return std.mem.indexOf(u8, raw, "\"status\":\"queued\"") != null or
-        std.mem.indexOf(u8, raw, "\"status\":\"running\"") != null or
-        std.mem.indexOf(u8, raw, "\"status\":\"cancelling\"") != null;
-}
-
-fn interruptedBacktestTaskJson(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    fallback_task_id: []const u8,
-) ![]u8 {
-    const task_id = jsonStringField(raw, "task_id") orelse fallback_task_id;
-    const created_at = jsonStringField(raw, "created_at") orelse "";
-    const cache_key = jsonStringField(raw, "cache_key") orelse "";
-    const updated_at = try allocTaskTimestamp(allocator);
-    defer allocator.free(updated_at);
-
-    var out = std.io.Writer.Allocating.init(allocator);
-    errdefer out.deinit();
-    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    try s.beginObject();
-    try s.objectField("task_id");
-    try s.write(task_id);
-    try s.objectField("status");
-    try s.write("failed");
-    try s.objectField("progress");
-    try s.write(@as(f64, 0.0));
-    try s.objectField("stage");
-    try s.write("interrupted");
-    try s.objectField("message");
-    try s.write("服务重启，任务已中断");
-    try s.objectField("created_at");
-    try s.write(created_at);
-    try s.objectField("updated_at");
-    try s.write(updated_at);
-    try s.objectField("cache_key");
-    try s.write(cache_key);
-    try s.objectField("cache_hit");
-    try s.write(false);
-    try s.objectField("queue_position");
-    try s.write(@as(usize, 0));
-    try s.objectField("running_count");
-    try s.write(backtest_task_store.running_count);
-    try s.objectField("max_concurrent");
-    try s.write(MAX_CONCURRENT_BACKTEST_TASKS);
-    try s.objectField("error");
-    try s.write("服务重启，任务已中断");
-    try s.endObject();
-    return out.toOwnedSlice();
-}
-
-fn loadPersistedBacktestTaskJson(
-    allocator: std.mem.Allocator,
-    workspace_dir: []const u8,
-    task_id: []const u8,
-) !?[]u8 {
-    const path = try backtestTaskStorePath(allocator, workspace_dir, task_id);
-    defer allocator.free(path);
-    const raw = std.fs.cwd().readFileAlloc(allocator, path, 20 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return null,
-    };
-    if (!persistedTaskJsonIsNonTerminal(raw)) return raw;
-
-    const interrupted = try interruptedBacktestTaskJson(allocator, raw, task_id);
-    writePersistedBacktestTaskJson(allocator, workspace_dir, task_id, interrupted);
-    allocator.free(raw);
-    return interrupted;
-}
-
 fn allocTaskTimestamp(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
 }
@@ -1394,7 +1171,7 @@ fn backtestTaskWorker(task: *BacktestTask) void {
     setBacktestTaskRunning(task);
     defer finishBacktestTask(task);
 
-    if (loadBacktestResultCache(allocator, task.workspace_dir, task.cache_key) catch null) |cached| {
+    if (result_cache.load(allocator, task.workspace_dir, task.cache_key) catch null) |cached| {
         backtest_task_store.mutex.lock();
         task.cache_hit = true;
         backtest_task_store.mutex.unlock();
@@ -1436,7 +1213,7 @@ fn backtestTaskWorker(task: *BacktestTask) void {
         setBacktestTaskCancelled(task);
         return;
     }
-    saveBacktestResultCache(allocator, task.workspace_dir, task.cache_key, result);
+    result_cache.save(allocator, task.workspace_dir, task.cache_key, result);
     setBacktestTaskCompleted(task, result);
 }
 
@@ -1493,7 +1270,7 @@ fn persistBacktestTaskLocked(task: *const BacktestTask) void {
         return;
     };
     defer backtest_task_store.allocator.free(body);
-    writePersistedBacktestTaskJson(backtest_task_store.allocator, task.workspace_dir, task.id, body);
+    task_files.writeJson(backtest_task_store.allocator, task.workspace_dir, task.id, body);
 }
 
 fn renderBacktestTaskJson(allocator: std.mem.Allocator, task_id: []const u8) !?[]u8 {
@@ -1527,12 +1304,12 @@ fn listBacktestTasksJson(allocator: std.mem.Allocator, workspace_dir: []const u8
     }
 
     if (count < limit) {
-        const dir_path = try backtestTaskStoreDir(allocator, workspace_dir);
+        const dir_path = try task_files.storeDir(allocator, workspace_dir);
         defer allocator.free(dir_path);
         var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch null;
         if (dir) |*d| {
             defer d.close();
-            var files = std.ArrayList(PersistedBacktestTaskFile){ .items = &.{}, .capacity = 0 };
+            var files = std.ArrayList(task_files.PersistedFile){ .items = &.{}, .capacity = 0 };
             defer {
                 for (files.items) |file| allocator.free(file.name);
                 files.deinit(allocator);
@@ -1546,7 +1323,7 @@ fn listBacktestTasksJson(allocator: std.mem.Allocator, workspace_dir: []const u8
                 errdefer allocator.free(name);
                 try files.append(allocator, .{ .name = name, .mtime = stat.mtime });
             }
-            std.mem.sort(PersistedBacktestTaskFile, files.items, {}, persistedBacktestTaskFileNewer);
+            std.mem.sort(task_files.PersistedFile, files.items, {}, task_files.newer);
 
             for (files.items) |file| {
                 if (count >= limit) break;
@@ -1557,7 +1334,7 @@ fn listBacktestTasksJson(allocator: std.mem.Allocator, workspace_dir: []const u8
                 backtest_task_store.mutex.unlock();
                 if (loaded) continue;
 
-                const body = (try loadPersistedBacktestTaskJson(allocator, workspace_dir, task_id)) orelse continue;
+                const body = (try task_files.loadJson(allocator, workspace_dir, task_id, backtest_task_store.running_count, MAX_CONCURRENT_BACKTEST_TASKS)) orelse continue;
                 defer allocator.free(body);
                 try s.beginWriteRaw();
                 try s.writer.writeAll(body);
@@ -1829,7 +1606,7 @@ fn handle_backtest_task_create(
     };
 
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
-    const cache_key = makeBacktestResultCacheKey(allocator, body, db) catch |err| {
+    const cache_key = result_cache.makeKey(allocator, body, db) catch |err| {
         std.debug.print("Backtest cache key error: {any}\n", .{err});
         try respondError(allocator, stream, 500, "failed to build backtest cache key");
         return;
@@ -1848,7 +1625,7 @@ fn handle_backtest_task_create(
         }
     }
 
-    const cached_result = loadBacktestResultCache(allocator, workspace_dir, cache_key) catch null;
+    const cached_result = result_cache.load(allocator, workspace_dir, cache_key) catch null;
     const task = backtest_task_store.create(body, path, cache_key, cached_result) catch |err| {
         if (cached_result) |cached| allocator.free(cached);
         std.debug.print("Backtest task create error: {any}\n", .{err});
@@ -1900,7 +1677,7 @@ fn handle_backtest_task_get(
             return;
         };
         const workspace_dir = std.fs.path.dirname(path) orelse ".";
-        break :blk (try loadPersistedBacktestTaskJson(allocator, workspace_dir, task_id)) orelse {
+        break :blk (try task_files.loadJson(allocator, workspace_dir, task_id, backtest_task_store.running_count, MAX_CONCURRENT_BACKTEST_TASKS)) orelse {
             try respondError(allocator, stream, 404, "backtest task not found");
             return;
         };
@@ -1959,10 +1736,10 @@ fn handle_backtest(
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
-    const cache_key = makeBacktestResultCacheKey(allocator, body, db) catch null;
+    const cache_key = result_cache.makeKey(allocator, body, db) catch null;
     defer if (cache_key) |key| allocator.free(key);
     if (cache_key) |key| {
-        if (loadBacktestResultCache(allocator, workspace_dir, key) catch null) |cached| {
+        if (result_cache.load(allocator, workspace_dir, key) catch null) |cached| {
             defer allocator.free(cached);
             try respond(stream, 200, cached);
             return;
@@ -1975,7 +1752,7 @@ fn handle_backtest(
     };
     defer allocator.free(result);
     if (cache_key) |key| {
-        saveBacktestResultCache(allocator, workspace_dir, key, result);
+        result_cache.save(allocator, workspace_dir, key, result);
     }
     try respond(stream, 200, result);
 }

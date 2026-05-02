@@ -47,4 +47,21 @@ script="$(< tauri-client.sh)"
 [[ "$script" == *"/api/stock/\${symbol}/full"* ]] || fail "stock CLI does not call Zig stock API"
 [[ "$script" == *"/api/backtest"* ]] || fail "backtest CLI does not call Zig backtest API"
 
+for module in \
+  zig/src/backtest_config.zig \
+  zig/src/backtest_hooks.zig \
+  zig/src/backtest_result_cache.zig \
+  zig/src/backtest_task_files.zig
+do
+  [[ -f "$module" ]] || fail "missing split Zig module: $module"
+done
+
+backtest_source="$(< zig/src/backtest.zig)"
+main_source="$(< zig/src/main.zig)"
+
+[[ "$backtest_source" == *'@import("backtest_config.zig")'* ]] || fail "backtest.zig does not import backtest_config.zig"
+[[ "$backtest_source" == *'@import("backtest_hooks.zig")'* ]] || fail "backtest.zig does not import backtest_hooks.zig"
+[[ "$main_source" == *'@import("backtest_result_cache.zig")'* ]] || fail "main.zig does not import backtest_result_cache.zig"
+[[ "$main_source" == *'@import("backtest_task_files.zig")'* ]] || fail "main.zig does not import backtest_task_files.zig"
+
 printf 'Zig-only project shape verified\n'

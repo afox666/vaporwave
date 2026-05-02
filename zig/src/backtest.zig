@@ -1,83 +1,30 @@
 const std = @import("std");
 const duckdb = @import("duckdb.zig");
 const baidu = @import("baidu.zig");
+const config = @import("backtest_config.zig");
+const hook_config = @import("backtest_hooks.zig");
 
-const MAX_FACTORS = 9;
 const FACTOR_CACHE_VERSION = "zig-factor-v1";
 const FACTOR_CACHE_SOURCE = "zig";
 
-pub const ProgressCallback = *const fn (ctx: *anyopaque, stage: []const u8, progress: f64, message: []const u8) void;
-pub const CancelCallback = *const fn (ctx: *anyopaque) bool;
+const MAX_FACTORS = config.MAX_FACTORS;
+const Factor = config.Factor;
+const Request = config.Request;
+const parseRequest = config.parseRequest;
+const parseFactor = config.parseFactor;
+const isDate = config.isDate;
+const executionModeName = config.executionModeName;
+const poolModeName = config.poolModeName;
+const factorName = config.factorName;
+const higherIsBetter = config.higherIsBetter;
+const maxLookback = config.maxLookback;
+const hasFactor = config.hasFactor;
 
-pub const Hooks = struct {
-    ctx: ?*anyopaque = null,
-    progress: ?ProgressCallback = null,
-    cancelled: ?CancelCallback = null,
-};
-
-fn emitProgress(hooks: Hooks, stage: []const u8, progress: f64, message: []const u8) void {
-    if (hooks.progress) |callback| {
-        if (hooks.ctx) |ctx| {
-            callback(ctx, stage, @max(0.0, @min(1.0, progress)), message);
-        }
-    }
-}
-
-fn checkCancelled(hooks: Hooks) !void {
-    if (hooks.cancelled) |callback| {
-        if (hooks.ctx) |ctx| {
-            if (callback(ctx)) return error.Cancelled;
-        }
-    }
-}
-
-const Factor = enum {
-    momentum_20d,
-    momentum_60d,
-    momentum_120d,
-    pe_percentile,
-    price_percentile,
-    volatility_20d,
-    volume_change,
-    rsi_14,
-    ma_deviation_20,
-};
-
-const ExecutionMode = enum {
-    close,
-    next_open,
-};
-
-const PoolMode = enum {
-    static,
-    dynamic,
-};
-
-const Request = struct {
-    factors: std.ArrayList(Factor),
-    start_date: []const u8,
-    end_date: []const u8,
-    rebalance_period: usize,
-    top_pct: f64,
-    bottom_pct: f64,
-    pool_size: usize,
-    industry: ?[]const u8,
-    commission_rate: f64,
-    stamp_tax_rate: f64,
-    slippage_rate: f64,
-    min_amount: f64,
-    min_listed_days: usize,
-    limit_pct: f64,
-    execution_mode: ExecutionMode,
-    pool_mode: PoolMode,
-
-    fn deinit(self: *Request, allocator: std.mem.Allocator) void {
-        allocator.free(self.start_date);
-        allocator.free(self.end_date);
-        if (self.industry) |industry| allocator.free(industry);
-        self.factors.deinit(allocator);
-    }
-};
+pub const ProgressCallback = hook_config.ProgressCallback;
+pub const CancelCallback = hook_config.CancelCallback;
+pub const Hooks = hook_config.Hooks;
+const emitProgress = hook_config.emitProgress;
+const checkCancelled = hook_config.checkCancelled;
 
 const PriceRow = struct {
     date: []const u8,
@@ -441,163 +388,9 @@ pub fn history(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !Request {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
-    if (parsed != .object) return error.BadRequest;
-    const obj = parsed.object;
-
-    var factors = std.ArrayList(Factor){ .items = &.{}, .capacity = 0 };
-    errdefer factors.deinit(allocator);
-    const factor_val = obj.get("factors") orelse return error.BadRequest;
-    if (factor_val != .array) return error.BadRequest;
-    for (factor_val.array.items) |item| {
-        if (item != .string) return error.BadRequest;
-        const factor = parseFactor(item.string) orelse return error.UnknownFactor;
-        try factors.append(allocator, factor);
-    }
-    if (factors.items.len == 0 or factors.items.len > MAX_FACTORS) return error.BadRequest;
-
-    const start = getString(obj, "start_date") orelse return error.BadRequest;
-    const end = getString(obj, "end_date") orelse return error.BadRequest;
-    if (!isDate(start) or !isDate(end)) return error.BadRequest;
-
-    const industry_raw = getString(obj, "industry");
-    const industry = if (industry_raw) |v| try allocator.dupe(u8, v) else null;
-
-    return Request{
-        .factors = factors,
-        .start_date = try allocator.dupe(u8, start),
-        .end_date = try allocator.dupe(u8, end),
-        .rebalance_period = @max(1, @as(usize, @intFromFloat(getNumber(obj, "rebalance_period", 20)))),
-        .top_pct = getNumber(obj, "top_pct", 0.2),
-        .bottom_pct = getNumber(obj, "bottom_pct", 0.0),
-        .pool_size = @max(1, @as(usize, @intFromFloat(getNumber(obj, "pool_size", 100)))),
-        .industry = industry,
-        .commission_rate = getNumber(obj, "commission_rate", 0.0003),
-        .stamp_tax_rate = getNumber(obj, "stamp_tax_rate", 0.0005),
-        .slippage_rate = getNumber(obj, "slippage_rate", 0.0002),
-        .min_amount = getNumber(obj, "min_amount", 10_000_000),
-        .min_listed_days = @max(1, @as(usize, @intFromFloat(getNumber(obj, "min_listed_days", 60)))),
-        .limit_pct = getNumber(obj, "limit_pct", 9.8),
-        .execution_mode = parseExecutionMode(getString(obj, "execution_price") orelse "next_open"),
-        .pool_mode = parsePoolMode(getString(obj, "pool_mode") orelse "dynamic"),
-    };
-}
-
-fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-fn getNumber(obj: std.json.ObjectMap, key: []const u8, default: f64) f64 {
-    const val = obj.get(key) orelse return default;
-    return switch (val) {
-        .integer => |v| @floatFromInt(v),
-        .float => |v| v,
-        .string => |s| std.fmt.parseFloat(f64, s) catch default,
-        else => default,
-    };
-}
-
-fn isDate(value: []const u8) bool {
-    if (value.len != 10) return false;
-    return std.ascii.isDigit(value[0]) and std.ascii.isDigit(value[1]) and
-        std.ascii.isDigit(value[2]) and std.ascii.isDigit(value[3]) and
-        value[4] == '-' and std.ascii.isDigit(value[5]) and
-        std.ascii.isDigit(value[6]) and value[7] == '-' and
-        std.ascii.isDigit(value[8]) and std.ascii.isDigit(value[9]);
-}
-
-fn parseFactor(name: []const u8) ?Factor {
-    if (std.mem.eql(u8, name, "momentum_20d")) return .momentum_20d;
-    if (std.mem.eql(u8, name, "momentum_60d")) return .momentum_60d;
-    if (std.mem.eql(u8, name, "momentum_120d")) return .momentum_120d;
-    if (std.mem.eql(u8, name, "pe_percentile")) return .pe_percentile;
-    if (std.mem.eql(u8, name, "price_percentile")) return .price_percentile;
-    if (std.mem.eql(u8, name, "volatility_20d")) return .volatility_20d;
-    if (std.mem.eql(u8, name, "volume_change")) return .volume_change;
-    if (std.mem.eql(u8, name, "rsi_14")) return .rsi_14;
-    if (std.mem.eql(u8, name, "ma_deviation_20")) return .ma_deviation_20;
-    return null;
-}
-
-fn parseExecutionMode(name: []const u8) ExecutionMode {
-    if (std.mem.eql(u8, name, "close")) return .close;
-    return .next_open;
-}
-
-fn executionModeName(mode: ExecutionMode) []const u8 {
-    return switch (mode) {
-        .close => "close",
-        .next_open => "next_open",
-    };
-}
-
-fn parsePoolMode(name: []const u8) PoolMode {
-    if (std.mem.eql(u8, name, "static")) return .static;
-    return .dynamic;
-}
-
-fn poolModeName(mode: PoolMode) []const u8 {
-    return switch (mode) {
-        .static => "static",
-        .dynamic => "dynamic",
-    };
-}
-
-fn factorName(factor: Factor) []const u8 {
-    return switch (factor) {
-        .momentum_20d => "momentum_20d",
-        .momentum_60d => "momentum_60d",
-        .momentum_120d => "momentum_120d",
-        .pe_percentile => "pe_percentile",
-        .price_percentile => "price_percentile",
-        .volatility_20d => "volatility_20d",
-        .volume_change => "volume_change",
-        .rsi_14 => "rsi_14",
-        .ma_deviation_20 => "ma_deviation_20",
-    };
-}
-
-fn higherIsBetter(factor: Factor) bool {
-    return factor != .volatility_20d;
-}
-
-fn factorLookback(factor: Factor) usize {
-    return switch (factor) {
-        .momentum_20d => 22,
-        .momentum_60d => 62,
-        .momentum_120d => 122,
-        .pe_percentile => 60,
-        .price_percentile => 60,
-        .volatility_20d => 21,
-        .volume_change => 21,
-        .rsi_14 => 15,
-        .ma_deviation_20 => 21,
-    };
-}
-
-fn maxLookback(factors: []const Factor) usize {
-    var out: usize = 30;
-    for (factors) |factor| out = @max(out, factorLookback(factor));
-    return out;
-}
-
-fn hasFactor(factors: []const Factor, target: Factor) bool {
-    for (factors) |factor| {
-        if (factor == target) return true;
-    }
-    return false;
-}
-
 fn queryLookbackStart(allocator: std.mem.Allocator, db: *duckdb.Db, start_date: []const u8, buffer_days: usize) ![]u8 {
-    const sql = try std.fmt.allocPrint(allocator,
+    const sql = try std.fmt.allocPrint(
+        allocator,
         "SELECT CAST(CAST((DATE '{s}' - INTERVAL {d} DAY) AS DATE) AS VARCHAR) AS lookback_start",
         .{ start_date, buffer_days },
     );
@@ -654,7 +447,8 @@ fn buildStockPool(
         return symbols;
     }
 
-    const fallback_sql = try std.fmt.allocPrint(allocator,
+    const fallback_sql = try std.fmt.allocPrint(
+        allocator,
         "SELECT DISTINCT symbol FROM daily_k ORDER BY symbol LIMIT {d}",
         .{pool_size},
     );
@@ -799,7 +593,8 @@ fn loadFallbackPool(
     pool_size: usize,
     symbols: *std.ArrayList([]const u8),
 ) !void {
-    const sql = try std.fmt.allocPrint(allocator,
+    const sql = try std.fmt.allocPrint(
+        allocator,
         "SELECT DISTINCT symbol FROM daily_k ORDER BY symbol LIMIT {d}",
         .{pool_size},
     );
@@ -920,9 +715,7 @@ fn upsertFactorCache(
     var out = std.io.Writer.Allocating.init(allocator);
     defer out.deinit();
     const w = &out.writer;
-    try w.writeAll(
-        "INSERT OR REPLACE INTO factor_daily (symbol, date, factor_name, factor_value, calc_version, source, updated_at) VALUES "
-    );
+    try w.writeAll("INSERT OR REPLACE INTO factor_daily (symbol, date, factor_name, factor_value, calc_version, source, updated_at) VALUES ");
     for (records, 0..) |record, idx| {
         if (idx > 0) try w.writeAll(", ");
         try w.print("('{s}', CAST('{s}' AS DATE), '{s}', {d}, '{s}', '{s}', CURRENT_TIMESTAMP)", .{
