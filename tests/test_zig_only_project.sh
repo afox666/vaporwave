@@ -64,4 +64,9 @@ main_source="$(< zig/src/main.zig)"
 [[ "$main_source" == *'@import("backtest_result_cache.zig")'* ]] || fail "main.zig does not import backtest_result_cache.zig"
 [[ "$main_source" == *'@import("backtest_task_files.zig")'* ]] || fail "main.zig does not import backtest_task_files.zig"
 
+(
+  cd zig
+  zig build test
+) || fail "zig build test failed"
+
 printf 'Zig-only project shape verified\n'
