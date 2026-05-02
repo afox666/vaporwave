@@ -243,8 +243,26 @@ sync_bundled_sidecar_if_needed() {
             cp "$SIDECAR_SRC" "$SIDECAR_EXEC"
             chmod +x "$SIDECAR_EXEC"
             log "  已同步 App 内 sidecar: $SIDECAR_EXEC"
+            resign_app_bundle_if_needed
         fi
     fi
+}
+
+resign_app_bundle_if_needed() {
+    [[ "$OSTYPE" == darwin* ]] || return 0
+    [[ -d "$APP_BUNDLE" ]] || return 0
+
+    require_cmd codesign
+    if codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "  App 签名已失效，正在重新签名..."
+    codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+    if ! codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+        die "App 重新签名失败"
+    fi
+    log "  App 已重新签名"
 }
 
 build_sidecar() {
@@ -294,6 +312,8 @@ ensure_app_exists() {
         log "未找到已构建的 Tauri 应用，开始构建..."
         build_app
     fi
+
+    resign_app_bundle_if_needed
 }
 
 ensure_sidecar_exists() {
@@ -332,7 +352,7 @@ health_for_sidecar() {
     port="${port%% *}"
 
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsS "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+        if curl --noproxy '*' -fsS "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
             log "  sidecar $pid: http://127.0.0.1:$port OK"
         else
             log "  sidecar $pid: http://127.0.0.1:$port 无响应"
