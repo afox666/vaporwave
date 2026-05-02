@@ -1,0 +1,47 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+.vite/
+
+# Cache
+.backtest_cache/
+.backtest_history/
+.backtest_result_cache/
+.backtest_tasks/
+
+# Market data database
+market_data.db
+market_data.db.wal
+market_data.db-shm
+celerybeat-schedule.db
+
+# Runtime pid files
+.server.pid
+.server.supervisor.pid
+.server.log
+.tauri-client.pid
+.vite.pid
+.vite.log
+.scheduler.pid
+.scheduler.log
+.scheduler-state
+
+# Native/build artifacts
+src-tauri/target/
+zig/.zig-cache/
+zig/zig-out/
+zig/main
+zig/test
+zig/test2
