@@ -4,6 +4,7 @@ import Dashboard from '../views/Dashboard.vue'
 import History from '../views/History.vue'
 import Scan from '../views/Scan.vue'
 import ScanHistory from '../views/ScanHistory.vue'
+import ScanPeriods from '../views/ScanPeriods.vue'
 import StockDetail from '../views/StockDetail.vue'
 import StockHistory from '../views/StockHistory.vue'
 
@@ -15,6 +16,7 @@ const router = createRouter({
     { path: '/', component: Dashboard },
     { path: '/scan', component: Scan },
     { path: '/scan/history', component: ScanHistory },
+    { path: '/scan/periods', component: ScanPeriods },
     { path: '/stock/:symbol', component: StockDetail },
     { path: '/backtest', component: Backtest },
     { path: '/history', component: History },

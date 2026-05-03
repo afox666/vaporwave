@@ -1,121 +1,45 @@
 const std = @import("std");
 const duckdb = @import("duckdb.zig");
 const baidu = @import("baidu.zig");
+const config = @import("backtest_config.zig");
+const factor_cache_config = @import("backtest_factor_cache.zig");
+const factor_math = @import("backtest_factors.zig");
+const hook_config = @import("backtest_hooks.zig");
+const types = @import("backtest_types.zig");
 
-const MAX_FACTORS = 9;
-const FACTOR_CACHE_VERSION = "zig-factor-v1";
-const FACTOR_CACHE_SOURCE = "zig";
+const MAX_FACTORS = config.MAX_FACTORS;
+const Factor = config.Factor;
+const Request = config.Request;
+const parseRequest = config.parseRequest;
+const isDate = config.isDate;
+const executionModeName = config.executionModeName;
+const poolModeName = config.poolModeName;
+const factorName = config.factorName;
+const higherIsBetter = config.higherIsBetter;
+const maxLookback = config.maxLookback;
+const hasFactor = config.hasFactor;
 
-pub const ProgressCallback = *const fn (ctx: *anyopaque, stage: []const u8, progress: f64, message: []const u8) void;
-pub const CancelCallback = *const fn (ctx: *anyopaque) bool;
+const FactorCacheStats = factor_cache_config.Stats;
+const FactorCache = factor_cache_config.Cache;
+const FactorCacheRecord = factor_cache_config.Record;
+const FACTOR_CACHE_VERSION = factor_cache_config.VERSION;
+const factorCacheKeyBuf = factor_cache_config.keyBuf;
+const loadFactorCache = factor_cache_config.load;
+const upsertFactorCache = factor_cache_config.upsert;
 
-pub const Hooks = struct {
-    ctx: ?*anyopaque = null,
-    progress: ?ProgressCallback = null,
-    cancelled: ?CancelCallback = null,
-};
+const computeFactor = factor_math.compute;
+const lastPeDateOnOrBefore = factor_math.lastPeDateOnOrBefore;
+const sampleStd = factor_math.sampleStd;
 
-fn emitProgress(hooks: Hooks, stage: []const u8, progress: f64, message: []const u8) void {
-    if (hooks.progress) |callback| {
-        if (hooks.ctx) |ctx| {
-            callback(ctx, stage, @max(0.0, @min(1.0, progress)), message);
-        }
-    }
-}
+pub const ProgressCallback = hook_config.ProgressCallback;
+pub const CancelCallback = hook_config.CancelCallback;
+pub const Hooks = hook_config.Hooks;
+const emitProgress = hook_config.emitProgress;
+const checkCancelled = hook_config.checkCancelled;
 
-fn checkCancelled(hooks: Hooks) !void {
-    if (hooks.cancelled) |callback| {
-        if (hooks.ctx) |ctx| {
-            if (callback(ctx)) return error.Cancelled;
-        }
-    }
-}
-
-const Factor = enum {
-    momentum_20d,
-    momentum_60d,
-    momentum_120d,
-    pe_percentile,
-    price_percentile,
-    volatility_20d,
-    volume_change,
-    rsi_14,
-    ma_deviation_20,
-};
-
-const ExecutionMode = enum {
-    close,
-    next_open,
-};
-
-const PoolMode = enum {
-    static,
-    dynamic,
-};
-
-const Request = struct {
-    factors: std.ArrayList(Factor),
-    start_date: []const u8,
-    end_date: []const u8,
-    rebalance_period: usize,
-    top_pct: f64,
-    bottom_pct: f64,
-    pool_size: usize,
-    industry: ?[]const u8,
-    commission_rate: f64,
-    stamp_tax_rate: f64,
-    slippage_rate: f64,
-    min_amount: f64,
-    min_listed_days: usize,
-    limit_pct: f64,
-    execution_mode: ExecutionMode,
-    pool_mode: PoolMode,
-
-    fn deinit(self: *Request, allocator: std.mem.Allocator) void {
-        allocator.free(self.start_date);
-        allocator.free(self.end_date);
-        if (self.industry) |industry| allocator.free(industry);
-        self.factors.deinit(allocator);
-    }
-};
-
-const PriceRow = struct {
-    date: []const u8,
-    open: f64,
-    close: f64,
-    high: f64,
-    low: f64,
-    volume: f64,
-    amount: f64,
-    change_pct: f64,
-};
-
-const PePoint = struct {
-    date: []const u8,
-    value: f64,
-};
-
-const StockData = struct {
-    symbol: []const u8,
-    prices: std.ArrayList(PriceRow),
-    pe_points: std.ArrayList(PePoint),
-
-    fn init(allocator: std.mem.Allocator, symbol: []const u8) !StockData {
-        return StockData{
-            .symbol = try allocator.dupe(u8, symbol),
-            .prices = std.ArrayList(PriceRow){ .items = &.{}, .capacity = 0 },
-            .pe_points = std.ArrayList(PePoint){ .items = &.{}, .capacity = 0 },
-        };
-    }
-
-    fn deinit(self: *StockData, allocator: std.mem.Allocator) void {
-        allocator.free(self.symbol);
-        for (self.prices.items) |row| allocator.free(row.date);
-        self.prices.deinit(allocator);
-        for (self.pe_points.items) |point| allocator.free(point.date);
-        self.pe_points.deinit(allocator);
-    }
-};
+const PriceRow = types.PriceRow;
+const PePoint = types.PePoint;
+const StockData = types.StockData;
 
 const Observation = struct {
     stock_index: usize,
@@ -223,42 +147,6 @@ const Metrics = struct {
     information_ratio: f64,
     num_periods: usize,
     periods_per_year: f64,
-};
-
-const FactorCacheStats = struct {
-    enabled: bool = false,
-    requested: usize = 0,
-    cacheable: usize = 0,
-    hits: usize = 0,
-    misses: usize = 0,
-    unavailable: usize = 0,
-    writes: usize = 0,
-    hit_rate: f64 = 0,
-};
-
-const FactorCache = struct {
-    values: std.StringHashMap(f64),
-    stats: FactorCacheStats,
-
-    fn init(allocator: std.mem.Allocator, stats: FactorCacheStats) FactorCache {
-        return FactorCache{
-            .values = std.StringHashMap(f64).init(allocator),
-            .stats = stats,
-        };
-    }
-
-    fn deinit(self: *FactorCache, allocator: std.mem.Allocator) void {
-        var it = self.values.keyIterator();
-        while (it.next()) |key| allocator.free(key.*);
-        self.values.deinit();
-    }
-};
-
-const FactorCacheRecord = struct {
-    symbol: []const u8,
-    date: []const u8,
-    factor: Factor,
-    value: f64,
 };
 
 pub fn run(
@@ -441,163 +329,9 @@ pub fn history(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !Request {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
-    if (parsed != .object) return error.BadRequest;
-    const obj = parsed.object;
-
-    var factors = std.ArrayList(Factor){ .items = &.{}, .capacity = 0 };
-    errdefer factors.deinit(allocator);
-    const factor_val = obj.get("factors") orelse return error.BadRequest;
-    if (factor_val != .array) return error.BadRequest;
-    for (factor_val.array.items) |item| {
-        if (item != .string) return error.BadRequest;
-        const factor = parseFactor(item.string) orelse return error.UnknownFactor;
-        try factors.append(allocator, factor);
-    }
-    if (factors.items.len == 0 or factors.items.len > MAX_FACTORS) return error.BadRequest;
-
-    const start = getString(obj, "start_date") orelse return error.BadRequest;
-    const end = getString(obj, "end_date") orelse return error.BadRequest;
-    if (!isDate(start) or !isDate(end)) return error.BadRequest;
-
-    const industry_raw = getString(obj, "industry");
-    const industry = if (industry_raw) |v| try allocator.dupe(u8, v) else null;
-
-    return Request{
-        .factors = factors,
-        .start_date = try allocator.dupe(u8, start),
-        .end_date = try allocator.dupe(u8, end),
-        .rebalance_period = @max(1, @as(usize, @intFromFloat(getNumber(obj, "rebalance_period", 20)))),
-        .top_pct = getNumber(obj, "top_pct", 0.2),
-        .bottom_pct = getNumber(obj, "bottom_pct", 0.0),
-        .pool_size = @max(1, @as(usize, @intFromFloat(getNumber(obj, "pool_size", 100)))),
-        .industry = industry,
-        .commission_rate = getNumber(obj, "commission_rate", 0.0003),
-        .stamp_tax_rate = getNumber(obj, "stamp_tax_rate", 0.0005),
-        .slippage_rate = getNumber(obj, "slippage_rate", 0.0002),
-        .min_amount = getNumber(obj, "min_amount", 10_000_000),
-        .min_listed_days = @max(1, @as(usize, @intFromFloat(getNumber(obj, "min_listed_days", 60)))),
-        .limit_pct = getNumber(obj, "limit_pct", 9.8),
-        .execution_mode = parseExecutionMode(getString(obj, "execution_price") orelse "next_open"),
-        .pool_mode = parsePoolMode(getString(obj, "pool_mode") orelse "dynamic"),
-    };
-}
-
-fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-fn getNumber(obj: std.json.ObjectMap, key: []const u8, default: f64) f64 {
-    const val = obj.get(key) orelse return default;
-    return switch (val) {
-        .integer => |v| @floatFromInt(v),
-        .float => |v| v,
-        .string => |s| std.fmt.parseFloat(f64, s) catch default,
-        else => default,
-    };
-}
-
-fn isDate(value: []const u8) bool {
-    if (value.len != 10) return false;
-    return std.ascii.isDigit(value[0]) and std.ascii.isDigit(value[1]) and
-        std.ascii.isDigit(value[2]) and std.ascii.isDigit(value[3]) and
-        value[4] == '-' and std.ascii.isDigit(value[5]) and
-        std.ascii.isDigit(value[6]) and value[7] == '-' and
-        std.ascii.isDigit(value[8]) and std.ascii.isDigit(value[9]);
-}
-
-fn parseFactor(name: []const u8) ?Factor {
-    if (std.mem.eql(u8, name, "momentum_20d")) return .momentum_20d;
-    if (std.mem.eql(u8, name, "momentum_60d")) return .momentum_60d;
-    if (std.mem.eql(u8, name, "momentum_120d")) return .momentum_120d;
-    if (std.mem.eql(u8, name, "pe_percentile")) return .pe_percentile;
-    if (std.mem.eql(u8, name, "price_percentile")) return .price_percentile;
-    if (std.mem.eql(u8, name, "volatility_20d")) return .volatility_20d;
-    if (std.mem.eql(u8, name, "volume_change")) return .volume_change;
-    if (std.mem.eql(u8, name, "rsi_14")) return .rsi_14;
-    if (std.mem.eql(u8, name, "ma_deviation_20")) return .ma_deviation_20;
-    return null;
-}
-
-fn parseExecutionMode(name: []const u8) ExecutionMode {
-    if (std.mem.eql(u8, name, "close")) return .close;
-    return .next_open;
-}
-
-fn executionModeName(mode: ExecutionMode) []const u8 {
-    return switch (mode) {
-        .close => "close",
-        .next_open => "next_open",
-    };
-}
-
-fn parsePoolMode(name: []const u8) PoolMode {
-    if (std.mem.eql(u8, name, "static")) return .static;
-    return .dynamic;
-}
-
-fn poolModeName(mode: PoolMode) []const u8 {
-    return switch (mode) {
-        .static => "static",
-        .dynamic => "dynamic",
-    };
-}
-
-fn factorName(factor: Factor) []const u8 {
-    return switch (factor) {
-        .momentum_20d => "momentum_20d",
-        .momentum_60d => "momentum_60d",
-        .momentum_120d => "momentum_120d",
-        .pe_percentile => "pe_percentile",
-        .price_percentile => "price_percentile",
-        .volatility_20d => "volatility_20d",
-        .volume_change => "volume_change",
-        .rsi_14 => "rsi_14",
-        .ma_deviation_20 => "ma_deviation_20",
-    };
-}
-
-fn higherIsBetter(factor: Factor) bool {
-    return factor != .volatility_20d;
-}
-
-fn factorLookback(factor: Factor) usize {
-    return switch (factor) {
-        .momentum_20d => 22,
-        .momentum_60d => 62,
-        .momentum_120d => 122,
-        .pe_percentile => 60,
-        .price_percentile => 60,
-        .volatility_20d => 21,
-        .volume_change => 21,
-        .rsi_14 => 15,
-        .ma_deviation_20 => 21,
-    };
-}
-
-fn maxLookback(factors: []const Factor) usize {
-    var out: usize = 30;
-    for (factors) |factor| out = @max(out, factorLookback(factor));
-    return out;
-}
-
-fn hasFactor(factors: []const Factor, target: Factor) bool {
-    for (factors) |factor| {
-        if (factor == target) return true;
-    }
-    return false;
-}
-
 fn queryLookbackStart(allocator: std.mem.Allocator, db: *duckdb.Db, start_date: []const u8, buffer_days: usize) ![]u8 {
-    const sql = try std.fmt.allocPrint(allocator,
+    const sql = try std.fmt.allocPrint(
+        allocator,
         "SELECT CAST(CAST((DATE '{s}' - INTERVAL {d} DAY) AS DATE) AS VARCHAR) AS lookback_start",
         .{ start_date, buffer_days },
     );
@@ -654,7 +388,8 @@ fn buildStockPool(
         return symbols;
     }
 
-    const fallback_sql = try std.fmt.allocPrint(allocator,
+    const fallback_sql = try std.fmt.allocPrint(
+        allocator,
         "SELECT DISTINCT symbol FROM daily_k ORDER BY symbol LIMIT {d}",
         .{pool_size},
     );
@@ -799,7 +534,8 @@ fn loadFallbackPool(
     pool_size: usize,
     symbols: *std.ArrayList([]const u8),
 ) !void {
-    const sql = try std.fmt.allocPrint(allocator,
+    const sql = try std.fmt.allocPrint(
+        allocator,
         "SELECT DISTINCT symbol FROM daily_k ORDER BY symbol LIMIT {d}",
         .{pool_size},
     );
@@ -829,116 +565,6 @@ fn symbolInListSql(allocator: std.mem.Allocator, symbols: []const []const u8) ![
         try out.appendSlice(allocator, part);
     }
     return out.toOwnedSlice(allocator);
-}
-
-fn factorInListSql(allocator: std.mem.Allocator, factors: []const Factor) ![]u8 {
-    var out = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    errdefer out.deinit(allocator);
-    for (factors, 0..) |factor, i| {
-        if (i > 0) try out.appendSlice(allocator, ",");
-        const part = try std.fmt.allocPrint(allocator, "'{s}'", .{factorName(factor)});
-        defer allocator.free(part);
-        try out.appendSlice(allocator, part);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn factorCacheKeyBuf(buf: []u8, symbol: []const u8, date: []const u8, factor: Factor) ![]const u8 {
-    return try std.fmt.bufPrint(buf, "{s}|{s}|{s}", .{ symbol, date, factorName(factor) });
-}
-
-fn loadFactorCache(
-    allocator: std.mem.Allocator,
-    db: *duckdb.Db,
-    symbols: []const []const u8,
-    dates: []const []const u8,
-    factors: []const Factor,
-) !FactorCache {
-    const stats = FactorCacheStats{
-        .enabled = true,
-        .requested = symbols.len * dates.len * factors.len,
-        .misses = symbols.len * dates.len * factors.len,
-        .unavailable = symbols.len * dates.len * factors.len,
-    };
-    var cache = FactorCache.init(allocator, stats);
-    errdefer cache.deinit(allocator);
-    if (stats.requested == 0) return cache;
-
-    const symbol_sql = try symbolInListSql(allocator, symbols);
-    defer allocator.free(symbol_sql);
-    const date_sql = try symbolInListSql(allocator, dates);
-    defer allocator.free(date_sql);
-    const factor_sql = try factorInListSql(allocator, factors);
-    defer allocator.free(factor_sql);
-
-    const sql = try std.fmt.allocPrint(allocator,
-        \\SELECT symbol, CAST(date AS VARCHAR) AS date, factor_name, factor_value
-        \\FROM factor_daily
-        \\WHERE symbol IN ({s})
-        \\  AND date IN ({s})
-        \\  AND factor_name IN ({s})
-        \\  AND calc_version = '{s}'
-        \\  AND factor_value IS NOT NULL
-    , .{ symbol_sql, date_sql, factor_sql, FACTOR_CACHE_VERSION });
-    defer allocator.free(sql);
-
-    var rows = db.queryRows(allocator, sql) catch |err| {
-        std.debug.print("Factor cache read failed: {any}\n", .{err});
-        cache.stats.enabled = false;
-        return cache;
-    };
-    defer rows.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < rows.rows.items.len) : (i += 1) {
-        const symbol = rows.getStr(i, "symbol") orelse continue;
-        const date = rows.getStr(i, "date") orelse continue;
-        const factor_name = rows.getStr(i, "factor_name") orelse continue;
-        const factor = parseFactor(factor_name) orelse continue;
-        const value = rows.getF64(i, "factor_value") orelse continue;
-        if (!std.math.isFinite(value)) continue;
-        const key = try std.fmt.allocPrint(allocator, "{s}|{s}|{s}", .{ symbol, date[0..@min(date.len, 10)], factorName(factor) });
-        try cache.values.put(key, value);
-    }
-    cache.stats.hits = cache.values.count();
-    cache.stats.misses = if (cache.stats.requested > cache.stats.hits) cache.stats.requested - cache.stats.hits else 0;
-    cache.stats.cacheable = cache.stats.hits;
-    cache.stats.unavailable = cache.stats.misses;
-    cache.stats.hit_rate = if (cache.stats.cacheable > 0)
-        @as(f64, @floatFromInt(cache.stats.hits)) / @as(f64, @floatFromInt(cache.stats.cacheable))
-    else
-        0;
-    return cache;
-}
-
-fn upsertFactorCache(
-    allocator: std.mem.Allocator,
-    db: *duckdb.Db,
-    records: []const FactorCacheRecord,
-) !usize {
-    if (records.len == 0) return 0;
-    var out = std.io.Writer.Allocating.init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
-    try w.writeAll(
-        "INSERT OR REPLACE INTO factor_daily (symbol, date, factor_name, factor_value, calc_version, source, updated_at) VALUES "
-    );
-    for (records, 0..) |record, idx| {
-        if (idx > 0) try w.writeAll(", ");
-        try w.print("('{s}', CAST('{s}' AS DATE), '{s}', {d}, '{s}', '{s}', CURRENT_TIMESTAMP)", .{
-            record.symbol,
-            record.date,
-            factorName(record.factor),
-            record.value,
-            FACTOR_CACHE_VERSION,
-            FACTOR_CACHE_SOURCE,
-        });
-    }
-    db.exec(out.written()) catch |err| {
-        std.debug.print("Factor cache write failed: {any}\n", .{err});
-        return 0;
-    };
-    return records.len;
 }
 
 fn loadPriceData(
@@ -1223,147 +849,6 @@ fn futurePriceIndex(prices: []const PriceRow, date: []const u8, next_date: ?[]co
         }
     }
     return out;
-}
-
-fn computeFactor(stock: *StockData, hist_idx: usize, date: []const u8, factor: Factor) ?f64 {
-    const rows = stock.prices.items;
-    return switch (factor) {
-        .momentum_20d => momentum(rows, hist_idx, 20),
-        .momentum_60d => momentum(rows, hist_idx, 60),
-        .momentum_120d => momentum(rows, hist_idx, 120),
-        .price_percentile => pricePercentile(rows, hist_idx),
-        .volatility_20d => volatility(rows, hist_idx),
-        .volume_change => volumeChange(rows, hist_idx),
-        .rsi_14 => rsi(rows, hist_idx),
-        .ma_deviation_20 => maDeviation(rows, hist_idx),
-        .pe_percentile => pePercentile(stock.pe_points.items, date),
-    };
-}
-
-fn momentum(rows: []const PriceRow, hist_idx: usize, days: usize) ?f64 {
-    if (hist_idx < days) return null;
-    const base = rows[hist_idx - days].close;
-    if (base == 0) return null;
-    return (rows[hist_idx].close - base) / base;
-}
-
-fn percentile(current: f64, values: []const f64) ?f64 {
-    if (values.len == 0 or !std.math.isFinite(current)) return null;
-    var less: usize = 0;
-    for (values) |v| {
-        if (v < current) less += 1;
-    }
-    return @as(f64, @floatFromInt(less)) / @as(f64, @floatFromInt(values.len)) * 100.0;
-}
-
-fn pricePercentile(rows: []const PriceRow, hist_idx: usize) ?f64 {
-    if (hist_idx + 1 < 60) return null;
-    var values_buf: [4096]f64 = undefined;
-    if (hist_idx + 1 > values_buf.len) return percentileDynamic(rows, hist_idx);
-    for (rows[0 .. hist_idx + 1], 0..) |row, i| values_buf[i] = row.close;
-    return percentile(rows[hist_idx].close, values_buf[0 .. hist_idx + 1]);
-}
-
-fn percentileDynamic(rows: []const PriceRow, hist_idx: usize) ?f64 {
-    var less: usize = 0;
-    const current = rows[hist_idx].close;
-    for (rows[0 .. hist_idx + 1]) |row| {
-        if (row.close < current) less += 1;
-    }
-    return @as(f64, @floatFromInt(less)) / @as(f64, @floatFromInt(hist_idx + 1)) * 100.0;
-}
-
-fn volatility(rows: []const PriceRow, hist_idx: usize) ?f64 {
-    if (hist_idx < 20) return null;
-    var vals: [20]f64 = undefined;
-    var i: usize = 0;
-    while (i < 20) : (i += 1) {
-        const idx = hist_idx - 19 + i;
-        const prev = rows[idx - 1].close;
-        if (prev == 0) return null;
-        vals[i] = (rows[idx].close - prev) / prev;
-    }
-    const sd = sampleStd(vals[0..]) orelse return null;
-    return sd * std.math.sqrt(252.0);
-}
-
-fn volumeChange(rows: []const PriceRow, hist_idx: usize) ?f64 {
-    if (hist_idx + 1 < 21) return null;
-    const short_avg = meanVolume(rows[hist_idx - 4 .. hist_idx + 1]);
-    const long_avg = meanVolume(rows[hist_idx - 19 .. hist_idx + 1]);
-    if (long_avg == 0) return null;
-    return short_avg / long_avg - 1;
-}
-
-fn meanVolume(rows: []const PriceRow) f64 {
-    var sum: f64 = 0;
-    for (rows) |row| sum += row.volume;
-    return sum / @as(f64, @floatFromInt(rows.len));
-}
-
-fn rsi(rows: []const PriceRow, hist_idx: usize) ?f64 {
-    if (hist_idx < 14) return null;
-    var gain: f64 = 0;
-    var loss: f64 = 0;
-    var i = hist_idx - 13;
-    while (i <= hist_idx) : (i += 1) {
-        const delta = rows[i].close - rows[i - 1].close;
-        if (delta > 0) gain += delta else loss += -delta;
-    }
-    gain /= 14.0;
-    loss /= 14.0;
-    if (loss == 0) return 100.0;
-    const rs = gain / loss;
-    return 100.0 - (100.0 / (1.0 + rs));
-}
-
-fn maDeviation(rows: []const PriceRow, hist_idx: usize) ?f64 {
-    if (hist_idx + 1 < 21) return null;
-    var sum: f64 = 0;
-    for (rows[hist_idx - 19 .. hist_idx + 1]) |row| sum += row.close;
-    const ma = sum / 20.0;
-    if (ma == 0) return null;
-    return (rows[hist_idx].close - ma) / ma;
-}
-
-fn pePercentile(points: []const PePoint, date: []const u8) ?f64 {
-    var values: [2048]f64 = undefined;
-    var n: usize = 0;
-    var current: ?f64 = null;
-    for (points) |point| {
-        if (std.mem.order(u8, point.date, date) == .gt) continue;
-        if (point.value <= 0) continue;
-        if (n < values.len) {
-            values[n] = point.value;
-            n += 1;
-            current = point.value;
-        }
-    }
-    if (n < 20) return null;
-    return percentile(current orelse return null, values[0..n]);
-}
-
-fn lastPeDateOnOrBefore(points: []const PePoint, date: []const u8) ?[]const u8 {
-    var out: ?[]const u8 = null;
-    for (points) |point| {
-        if (std.mem.order(u8, point.date, date) == .gt) continue;
-        if (point.value <= 0) continue;
-        out = point.date;
-    }
-    return out;
-}
-
-fn sampleStd(vals: []const f64) ?f64 {
-    if (vals.len < 2) return null;
-    var sum: f64 = 0;
-    for (vals) |v| sum += v;
-    const mean = sum / @as(f64, @floatFromInt(vals.len));
-    var ss: f64 = 0;
-    for (vals) |v| {
-        const d = v - mean;
-        ss += d * d;
-    }
-    return std.math.sqrt(ss / @as(f64, @floatFromInt(vals.len - 1)));
 }
 
 fn buildPortfolio(

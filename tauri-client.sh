@@ -197,11 +197,18 @@ cli_request() {
     fi
 
     if [[ "$method" == "POST" ]]; then
-        [[ -n "$body_file" && -f "$body_file" ]] || die "POST 请求需要可读取的 JSON 文件"
-        curl --noproxy '*' -fsS \
-            -H "Content-Type: application/json" \
-            --data-binary "@$body_file" \
-            "$base_url$api_path"
+        if [[ -n "$body_file" ]]; then
+            [[ -f "$body_file" ]] || die "POST 请求需要可读取的 JSON 文件"
+            curl --noproxy '*' -fsS \
+                -H "Content-Type: application/json" \
+                --data-binary "@$body_file" \
+                "$base_url$api_path"
+        else
+            curl --noproxy '*' -fsS \
+                -X POST \
+                -H "Content-Type: application/json" \
+                "$base_url$api_path"
+        fi
     else
         curl --noproxy '*' -fsS "$base_url$api_path"
     fi
@@ -211,6 +218,28 @@ cli_request() {
 cli_scan() {
     local top_n="${1:-100}"
     cli_request GET "/api/scan?top_n=${top_n}"
+}
+
+cli_scan_period() {
+    local action="${1:-list}"
+    local period="${2:-week}"
+    local period_start="${3:-}"
+
+    case "$action" in
+        list)
+            cli_request GET "/api/scan/periods?period=${period}"
+            ;;
+        detail)
+            [[ -n "$period_start" ]] || die "用法: ./tauri-client.sh scan-period detail <week|month|quarter> <YYYY-MM-DD>"
+            cli_request GET "/api/scan/periods/${period}/${period_start}"
+            ;;
+        rebuild)
+            cli_request POST "/api/scan/periods/rebuild?period=${period}"
+            ;;
+        *)
+            die "用法: ./tauri-client.sh scan-period {list|detail|rebuild} [week|month|quarter|all] [YYYY-MM-DD]"
+            ;;
+    esac
 }
 
 cli_stock() {
@@ -243,8 +272,26 @@ sync_bundled_sidecar_if_needed() {
             cp "$SIDECAR_SRC" "$SIDECAR_EXEC"
             chmod +x "$SIDECAR_EXEC"
             log "  已同步 App 内 sidecar: $SIDECAR_EXEC"
+            resign_app_bundle_if_needed
         fi
     fi
+}
+
+resign_app_bundle_if_needed() {
+    [[ "$OSTYPE" == darwin* ]] || return 0
+    [[ -d "$APP_BUNDLE" ]] || return 0
+
+    require_cmd codesign
+    if codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "  App 签名已失效，正在重新签名..."
+    codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+    if ! codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+        die "App 重新签名失败"
+    fi
+    log "  App 已重新签名"
 }
 
 build_sidecar() {
@@ -294,6 +341,8 @@ ensure_app_exists() {
         log "未找到已构建的 Tauri 应用，开始构建..."
         build_app
     fi
+
+    resign_app_bundle_if_needed
 }
 
 ensure_sidecar_exists() {
@@ -332,7 +381,7 @@ health_for_sidecar() {
     port="${port%% *}"
 
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsS "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+        if curl --noproxy '*' -fsS "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
             log "  sidecar $pid: http://127.0.0.1:$port OK"
         else
             log "  sidecar $pid: http://127.0.0.1:$port 无响应"
@@ -625,6 +674,9 @@ usage() {
   ./tauri-client.sh rebuild      # 停止、构建、再启动
   ./tauri-client.sh sync stats   # 使用 Zig 后端执行数据同步/统计命令
   ./tauri-client.sh scan [100]   # 使用 Zig API 扫描市场，输出 JSON
+  ./tauri-client.sh scan-period list week
+  ./tauri-client.sh scan-period detail week 2026-04-27
+  ./tauri-client.sh scan-period rebuild all
   ./tauri-client.sh stock 600519 # 使用 Zig API 输出单股完整分析 JSON
   ./tauri-client.sh backtest request.json # 使用 Zig API 运行同步回测
   ./tauri-client.sh scheduler start [30]
@@ -647,6 +699,9 @@ usage() {
 
 CLI 示例:
   ./tauri-client.sh scan 50
+  ./tauri-client.sh scan-period list week
+  ./tauri-client.sh scan-period detail week 2026-04-27
+  ./tauri-client.sh scan-period rebuild all
   ./tauri-client.sh stock 600519
   ./tauri-client.sh backtest examples/backtest-request.json
 
@@ -695,6 +750,10 @@ case "${1:-toggle}" in
     scan)
         shift || true
         cli_scan "${1:-100}"
+        ;;
+    scan-period)
+        shift || true
+        cli_scan_period "${1:-list}" "${2:-week}" "${3:-}"
         ;;
     stock)
         shift || true

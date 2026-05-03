@@ -247,8 +247,11 @@ export interface StockSearchResult {
 
 export interface ScanHistoryItem {
   scan_date: string
+  data_date?: string
   top_n: number
   total_stocks: number
+  source?: string
+  coverage_count?: number
   created_at: string | null
 }
 
@@ -265,6 +268,50 @@ export interface ScanHistoryStock {
 export interface ScanHistoryDetail {
   scan_date: string
   stocks: ScanHistoryStock[]
+}
+
+export type ScanPeriod = 'week' | 'month' | 'quarter'
+export type ScanPeriodRequest = ScanPeriod | 'all'
+
+export interface ScanPeriodItem {
+  period: ScanPeriod
+  period_start: string
+  period_end: string
+  top_n: number
+  candidate_count: number
+  scan_days: number
+  data_start: string
+  data_end: string
+  is_current: boolean
+  updated_at: string
+}
+
+export interface ScanPeriodStock {
+  rank: number
+  symbol: string
+  name: string
+  industry: string
+  period_score: number
+  appearances: number
+  best_rank: number
+  avg_rank: number
+  avg_daily_score: number
+  score_delta: number
+  return_pct: number
+  first_seen_date: string
+  latest_seen_date: string
+  latest_price: number | null
+  latest_change_pct: number | null
+}
+
+export interface ScanPeriodDetail extends ScanPeriodItem {
+  stocks: ScanPeriodStock[]
+}
+
+export interface ScanPeriodRebuildResult {
+  period: ScanPeriodRequest
+  top_n: number
+  rebuilt: number
 }
 
 // --- Tauri support ---
@@ -419,6 +466,31 @@ export const getScanHistoryDetail = (date: string) =>
 export const triggerScan = (topN = 100) =>
   request<{ scan_date: string; total: number; stocks: StockInfo[] }>('POST', '/scan/run', { top_n: topN })
 
+export const getScanPeriods = (period: ScanPeriod = 'week', limit = 100) =>
+  request<ScanPeriodItem[]>('GET', '/scan/periods', { period, limit }).then(res => ({
+    data: Array.isArray(res.data) ? res.data : [],
+  }))
+
+export const getScanPeriodDetail = (period: ScanPeriod, periodStart: string) =>
+  request<ScanPeriodDetail>('GET', `/scan/periods/${period}/${periodStart}`).then(res => ({
+    data: {
+      period,
+      period_start: res.data?.period_start || periodStart,
+      period_end: res.data?.period_end || '',
+      top_n: Number(res.data?.top_n || 0),
+      candidate_count: Number(res.data?.candidate_count || 0),
+      scan_days: Number(res.data?.scan_days || 0),
+      data_start: res.data?.data_start || '',
+      data_end: res.data?.data_end || '',
+      is_current: Boolean(res.data?.is_current),
+      updated_at: res.data?.updated_at || '',
+      stocks: Array.isArray(res.data?.stocks) ? res.data.stocks : [],
+    },
+  }))
+
+export const rebuildScanPeriods = (period: ScanPeriodRequest = 'all', topN = 100) =>
+  request<ScanPeriodRebuildResult>('POST', '/scan/periods/rebuild', { period, top_n: topN })
+
 export default {
   scanMarket,
   searchStock,
@@ -439,6 +511,9 @@ export default {
   getScanHistory,
   getScanHistoryDetail,
   triggerScan,
+  getScanPeriods,
+  getScanPeriodDetail,
+  rebuildScanPeriods,
   initTauri,
   isTauriRuntime,
 }

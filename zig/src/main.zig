@@ -10,11 +10,14 @@ const baidu = @import("baidu.zig");
 const tencent = @import("tencent.zig");
 const duckdb = @import("duckdb.zig");
 const backtest = @import("backtest.zig");
+const http = @import("http_helpers.zig");
+const result_cache = @import("backtest_result_cache.zig");
+const sql_text = @import("sql_text.zig");
+const task_files = @import("backtest_task_files.zig");
 const sync = @import("sync.zig");
 
 const MAX_BACKTEST_TASKS = 50;
 const MAX_CONCURRENT_BACKTEST_TASKS = 1;
-const RESULT_CACHE_VERSION = "zig-result-v1";
 
 const BacktestTaskStatus = enum {
     queued,
@@ -375,9 +378,15 @@ fn initSchema(db: *duckdb.Db) !void {
         \\    scan_date DATE PRIMARY KEY,
         \\    top_n INTEGER,
         \\    total_stocks INTEGER,
+        \\    data_date DATE,
+        \\    source VARCHAR,
+        \\    coverage_count INTEGER,
         \\    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         \\)
     );
+    try db.exec("ALTER TABLE scan_result ADD COLUMN IF NOT EXISTS data_date DATE");
+    try db.exec("ALTER TABLE scan_result ADD COLUMN IF NOT EXISTS source VARCHAR");
+    try db.exec("ALTER TABLE scan_result ADD COLUMN IF NOT EXISTS coverage_count INTEGER");
     try db.exec(
         \\CREATE TABLE IF NOT EXISTS scan_stock (
         \\    scan_date DATE,
@@ -392,6 +401,45 @@ fn initSchema(db: *duckdb.Db) !void {
         \\)
     );
     try db.exec("CREATE INDEX IF NOT EXISTS idx_scan_stock_date ON scan_stock (scan_date)");
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS scan_period_result (
+        \\    period VARCHAR,
+        \\    period_start DATE,
+        \\    period_end DATE,
+        \\    top_n INTEGER,
+        \\    candidate_count INTEGER,
+        \\    scan_days INTEGER,
+        \\    data_start DATE,
+        \\    data_end DATE,
+        \\    is_current BOOLEAN,
+        \\    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY (period, period_start)
+        \\)
+    );
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS scan_period_stock (
+        \\    period VARCHAR,
+        \\    period_start DATE,
+        \\    rank INTEGER,
+        \\    symbol VARCHAR,
+        \\    name VARCHAR,
+        \\    industry VARCHAR,
+        \\    period_score DOUBLE,
+        \\    appearances INTEGER,
+        \\    best_rank INTEGER,
+        \\    avg_rank DOUBLE,
+        \\    avg_daily_score DOUBLE,
+        \\    score_delta DOUBLE,
+        \\    return_pct DOUBLE,
+        \\    first_seen_date DATE,
+        \\    latest_seen_date DATE,
+        \\    latest_price DOUBLE,
+        \\    latest_change_pct DOUBLE,
+        \\    PRIMARY KEY (period, period_start, symbol)
+        \\)
+    );
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_scan_period_result_period ON scan_period_result (period, period_start)");
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_scan_period_stock_period ON scan_period_stock (period, period_start, rank)");
     try db.exec(
         \\CREATE TABLE IF NOT EXISTS job_config (
         \\    job_name VARCHAR PRIMARY KEY,
@@ -502,7 +550,7 @@ fn writeSchedulerStateFile(
     scheduled_for: ?[]const u8,
     message: ?[]const u8,
 ) !void {
-    const safe_message = try sqlEscape(allocator, message orelse "");
+    const safe_message = try sql_text.escape(allocator, message orelse "");
     defer allocator.free(safe_message);
 
     const content = try std.fmt.allocPrint(
@@ -554,7 +602,7 @@ fn runJobCommand(
         const scan_date = try resolveScheduledScanDate(allocator, db, scheduled_for);
         defer allocator.free(scan_date);
 
-        try saveScanToDb(db, allocator, scan_date, top_n, scan.items);
+        try saveScanToDb(db, allocator, scan_date, top_n, scan.items, scan.data_date, scan.source, scan.coverage_count);
         return std.fmt.allocPrint(
             allocator,
             "job=scan-daily scan_date={s} source={s} total={d} data_date={s} coverage={d}",
@@ -571,7 +619,7 @@ fn runJobCommand(
         const scan_date = try resolveScheduledScanDate(allocator, db, scheduled_for);
         defer allocator.free(scan_date);
 
-        try saveScanToDb(db, allocator, scan_date, top_n, scan.items);
+        try saveScanToDb(db, allocator, scan_date, top_n, scan.items, scan.data_date, scan.source, scan.coverage_count);
         return std.fmt.allocPrint(
             allocator,
             "job=daily-pipeline scan_date={s} source={s} total={d} data_date={s} coverage={d} sync_limit={d}",
@@ -939,7 +987,7 @@ fn markJobFinished(
     message: []const u8,
 ) !void {
     const safe_job_name = if (isSafeJobName(job_name)) job_name else return error.InvalidJobName;
-    const escaped = try sqlEscape(allocator, message);
+    const escaped = try sql_text.escape(allocator, message);
     defer allocator.free(escaped);
 
     const query = try std.fmt.allocPrint(allocator,
@@ -991,23 +1039,6 @@ fn queryCount(allocator: std.mem.Allocator, db: *duckdb.Db, query: []const u8) !
     return std.fmt.parseInt(usize, rows.rows.items[0].items[0], 10) catch 0;
 }
 
-fn sqlEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    errdefer out.deinit(allocator);
-
-    for (input) |ch| {
-        if (ch == '\'') {
-            try out.appendSlice(allocator, "''");
-        } else if (ch == '\n' or ch == '\r') {
-            try out.append(allocator, ' ');
-        } else {
-            try out.append(allocator, ch);
-        }
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
-
 fn makeBacktestTaskId(allocator: std.mem.Allocator) ![]const u8 {
     var bytes: [6]u8 = undefined;
     std.crypto.random.bytes(&bytes);
@@ -1015,230 +1046,6 @@ fn makeBacktestTaskId(allocator: std.mem.Allocator) ![]const u8 {
     const out = try allocator.alloc(u8, bytes.len * 2);
     @memcpy(out, &hex);
     return out;
-}
-
-fn sha256Hex(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(input, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const out = try allocator.alloc(u8, 24);
-    @memcpy(out, hex[0..24]);
-    return out;
-}
-
-fn queryBacktestDataFingerprint(allocator: std.mem.Allocator, db: ?*duckdb.Db) ![]const u8 {
-    const d = db orelse return try allocator.dupe(u8, "daily_k:no-db");
-    var rows = d.queryRows(
-        allocator,
-        "SELECT COUNT(*) AS cnt, COALESCE(CAST(MAX(date) AS VARCHAR), '') AS max_date, COALESCE(CAST(MAX(updated_at) AS VARCHAR), '') AS max_updated FROM daily_k",
-    ) catch {
-        return try allocator.dupe(u8, "daily_k:unknown");
-    };
-    defer rows.deinit(allocator);
-    const cnt = rows.getStr(0, "cnt") orelse "0";
-    const max_date = rows.getStr(0, "max_date") orelse "";
-    const max_updated = rows.getStr(0, "max_updated") orelse "";
-    return std.fmt.allocPrint(allocator, "daily_k:{s}:{s}:{s}", .{ cnt, max_date, max_updated });
-}
-
-fn makeBacktestResultCacheKey(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    db: ?*duckdb.Db,
-) ![]const u8 {
-    const fingerprint = try queryBacktestDataFingerprint(allocator, db);
-    defer allocator.free(fingerprint);
-    var raw = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-    defer raw.deinit(allocator);
-    try raw.appendSlice(allocator, RESULT_CACHE_VERSION);
-    try raw.append(allocator, '\n');
-    try raw.appendSlice(allocator, fingerprint);
-    try raw.append(allocator, '\n');
-    try raw.appendSlice(allocator, std.mem.trim(u8, body, " \t\r\n"));
-    return sha256Hex(allocator, raw.items);
-}
-
-fn backtestResultCacheDir(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_result_cache/zig", .{workspace_dir});
-}
-
-fn backtestResultCachePath(allocator: std.mem.Allocator, workspace_dir: []const u8, cache_key: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_result_cache/zig/{s}.json", .{ workspace_dir, cache_key });
-}
-
-fn loadBacktestResultCache(allocator: std.mem.Allocator, workspace_dir: []const u8, cache_key: []const u8) !?[]u8 {
-    const path = try backtestResultCachePath(allocator, workspace_dir, cache_key);
-    defer allocator.free(path);
-    return std.fs.cwd().readFileAlloc(allocator, path, 20 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => null,
-    };
-}
-
-fn saveBacktestResultCache(allocator: std.mem.Allocator, workspace_dir: []const u8, cache_key: []const u8, result: []const u8) void {
-    const dir = backtestResultCacheDir(allocator, workspace_dir) catch return;
-    defer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch |err| {
-        std.debug.print("Backtest result cache mkdir failed: {any}\n", .{err});
-        return;
-    };
-    const path = backtestResultCachePath(allocator, workspace_dir, cache_key) catch return;
-    defer allocator.free(path);
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
-    defer allocator.free(tmp_path);
-    std.fs.cwd().writeFile(.{ .sub_path = tmp_path, .data = result }) catch |err| {
-        std.debug.print("Backtest result cache write failed: {any}\n", .{err});
-        return;
-    };
-    std.fs.cwd().rename(tmp_path, path) catch |err| {
-        std.debug.print("Backtest result cache rename failed: {any}\n", .{err});
-    };
-}
-
-const PersistedBacktestTaskFile = struct {
-    name: []const u8,
-    mtime: i128,
-};
-
-fn persistedBacktestTaskFileNewer(_: void, a: PersistedBacktestTaskFile, b: PersistedBacktestTaskFile) bool {
-    return a.mtime > b.mtime;
-}
-
-fn backtestTaskStoreDir(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_tasks/zig", .{workspace_dir});
-}
-
-fn backtestTaskStorePath(allocator: std.mem.Allocator, workspace_dir: []const u8, task_id: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.backtest_tasks/zig/{s}.json", .{ workspace_dir, task_id });
-}
-
-fn writePersistedBacktestTaskJson(
-    allocator: std.mem.Allocator,
-    workspace_dir: []const u8,
-    task_id: []const u8,
-    body: []const u8,
-) void {
-    const dir = backtestTaskStoreDir(allocator, workspace_dir) catch return;
-    defer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch |err| {
-        std.debug.print("Backtest task store mkdir failed: {any}\n", .{err});
-        return;
-    };
-
-    const path = backtestTaskStorePath(allocator, workspace_dir, task_id) catch return;
-    defer allocator.free(path);
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
-    defer allocator.free(tmp_path);
-
-    std.fs.cwd().writeFile(.{ .sub_path = tmp_path, .data = body }) catch |err| {
-        std.debug.print("Backtest task store write failed: {any}\n", .{err});
-        return;
-    };
-    std.fs.cwd().rename(tmp_path, path) catch |err| {
-        std.debug.print("Backtest task store rename failed: {any}\n", .{err});
-    };
-}
-
-fn jsonStringField(json: []const u8, field: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, json, search_from, field)) |idx| {
-        search_from = idx + field.len;
-        if (idx == 0 or json[idx - 1] != '"') continue;
-        if (idx + field.len >= json.len or json[idx + field.len] != '"') continue;
-
-        var pos = idx + field.len + 1;
-        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) : (pos += 1) {}
-        if (pos >= json.len or json[pos] != ':') continue;
-        pos += 1;
-        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) : (pos += 1) {}
-        if (pos >= json.len or json[pos] != '"') continue;
-        pos += 1;
-
-        const value_start = pos;
-        var escaped = false;
-        while (pos < json.len) : (pos += 1) {
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (json[pos] == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (json[pos] == '"') return json[value_start..pos];
-        }
-    }
-    return null;
-}
-
-fn persistedTaskJsonIsNonTerminal(raw: []const u8) bool {
-    return std.mem.indexOf(u8, raw, "\"status\":\"queued\"") != null or
-        std.mem.indexOf(u8, raw, "\"status\":\"running\"") != null or
-        std.mem.indexOf(u8, raw, "\"status\":\"cancelling\"") != null;
-}
-
-fn interruptedBacktestTaskJson(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    fallback_task_id: []const u8,
-) ![]u8 {
-    const task_id = jsonStringField(raw, "task_id") orelse fallback_task_id;
-    const created_at = jsonStringField(raw, "created_at") orelse "";
-    const cache_key = jsonStringField(raw, "cache_key") orelse "";
-    const updated_at = try allocTaskTimestamp(allocator);
-    defer allocator.free(updated_at);
-
-    var out = std.io.Writer.Allocating.init(allocator);
-    errdefer out.deinit();
-    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    try s.beginObject();
-    try s.objectField("task_id");
-    try s.write(task_id);
-    try s.objectField("status");
-    try s.write("failed");
-    try s.objectField("progress");
-    try s.write(@as(f64, 0.0));
-    try s.objectField("stage");
-    try s.write("interrupted");
-    try s.objectField("message");
-    try s.write("服务重启，任务已中断");
-    try s.objectField("created_at");
-    try s.write(created_at);
-    try s.objectField("updated_at");
-    try s.write(updated_at);
-    try s.objectField("cache_key");
-    try s.write(cache_key);
-    try s.objectField("cache_hit");
-    try s.write(false);
-    try s.objectField("queue_position");
-    try s.write(@as(usize, 0));
-    try s.objectField("running_count");
-    try s.write(backtest_task_store.running_count);
-    try s.objectField("max_concurrent");
-    try s.write(MAX_CONCURRENT_BACKTEST_TASKS);
-    try s.objectField("error");
-    try s.write("服务重启，任务已中断");
-    try s.endObject();
-    return out.toOwnedSlice();
-}
-
-fn loadPersistedBacktestTaskJson(
-    allocator: std.mem.Allocator,
-    workspace_dir: []const u8,
-    task_id: []const u8,
-) !?[]u8 {
-    const path = try backtestTaskStorePath(allocator, workspace_dir, task_id);
-    defer allocator.free(path);
-    const raw = std.fs.cwd().readFileAlloc(allocator, path, 20 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return null,
-    };
-    if (!persistedTaskJsonIsNonTerminal(raw)) return raw;
-
-    const interrupted = try interruptedBacktestTaskJson(allocator, raw, task_id);
-    writePersistedBacktestTaskJson(allocator, workspace_dir, task_id, interrupted);
-    allocator.free(raw);
-    return interrupted;
 }
 
 fn allocTaskTimestamp(allocator: std.mem.Allocator) ![]const u8 {
@@ -1394,7 +1201,7 @@ fn backtestTaskWorker(task: *BacktestTask) void {
     setBacktestTaskRunning(task);
     defer finishBacktestTask(task);
 
-    if (loadBacktestResultCache(allocator, task.workspace_dir, task.cache_key) catch null) |cached| {
+    if (result_cache.load(allocator, task.workspace_dir, task.cache_key) catch null) |cached| {
         backtest_task_store.mutex.lock();
         task.cache_hit = true;
         backtest_task_store.mutex.unlock();
@@ -1436,7 +1243,7 @@ fn backtestTaskWorker(task: *BacktestTask) void {
         setBacktestTaskCancelled(task);
         return;
     }
-    saveBacktestResultCache(allocator, task.workspace_dir, task.cache_key, result);
+    result_cache.save(allocator, task.workspace_dir, task.cache_key, result);
     setBacktestTaskCompleted(task, result);
 }
 
@@ -1493,7 +1300,7 @@ fn persistBacktestTaskLocked(task: *const BacktestTask) void {
         return;
     };
     defer backtest_task_store.allocator.free(body);
-    writePersistedBacktestTaskJson(backtest_task_store.allocator, task.workspace_dir, task.id, body);
+    task_files.writeJson(backtest_task_store.allocator, task.workspace_dir, task.id, body);
 }
 
 fn renderBacktestTaskJson(allocator: std.mem.Allocator, task_id: []const u8) !?[]u8 {
@@ -1527,12 +1334,12 @@ fn listBacktestTasksJson(allocator: std.mem.Allocator, workspace_dir: []const u8
     }
 
     if (count < limit) {
-        const dir_path = try backtestTaskStoreDir(allocator, workspace_dir);
+        const dir_path = try task_files.storeDir(allocator, workspace_dir);
         defer allocator.free(dir_path);
         var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch null;
         if (dir) |*d| {
             defer d.close();
-            var files = std.ArrayList(PersistedBacktestTaskFile){ .items = &.{}, .capacity = 0 };
+            var files = std.ArrayList(task_files.PersistedFile){ .items = &.{}, .capacity = 0 };
             defer {
                 for (files.items) |file| allocator.free(file.name);
                 files.deinit(allocator);
@@ -1546,7 +1353,7 @@ fn listBacktestTasksJson(allocator: std.mem.Allocator, workspace_dir: []const u8
                 errdefer allocator.free(name);
                 try files.append(allocator, .{ .name = name, .mtime = stat.mtime });
             }
-            std.mem.sort(PersistedBacktestTaskFile, files.items, {}, persistedBacktestTaskFileNewer);
+            std.mem.sort(task_files.PersistedFile, files.items, {}, task_files.newer);
 
             for (files.items) |file| {
                 if (count >= limit) break;
@@ -1557,7 +1364,7 @@ fn listBacktestTasksJson(allocator: std.mem.Allocator, workspace_dir: []const u8
                 backtest_task_store.mutex.unlock();
                 if (loaded) continue;
 
-                const body = (try loadPersistedBacktestTaskJson(allocator, workspace_dir, task_id)) orelse continue;
+                const body = (try task_files.loadJson(allocator, workspace_dir, task_id, backtest_task_store.running_count, MAX_CONCURRENT_BACKTEST_TASKS)) orelse continue;
                 defer allocator.free(body);
                 try s.beginWriteRaw();
                 try s.writer.writeAll(body);
@@ -1611,7 +1418,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         if (header_len == null) {
             if (std.mem.indexOf(u8, request.items, "\r\n\r\n")) |idx| {
                 header_len = idx + 4;
-                body_len = parseContentLength(request.items[0..idx]);
+                body_len = http.parseContentLength(request.items[0..idx]);
             }
         }
 
@@ -1620,7 +1427,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         }
 
         if (request.items.len > 10 * 1024 * 1024) {
-            try respondError(allocator, stream, 500, "request too large");
+            try http.respondError(allocator, stream, 500, "request too large");
             return;
         }
     }
@@ -1652,12 +1459,17 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     if (!is_get and !is_post) {
         const ErrStruct = struct { err: []const u8 };
         const err_json = try std.json.Stringify.valueAlloc(allocator, ErrStruct{ .err = "Method not allowed" }, .{});
-        try respond(stream, 405, err_json);
+        try http.respond(stream, 405, err_json);
         return;
     }
 
     if (is_post and std.mem.startsWith(u8, uri, "/api/scan/run")) {
         try handle_scan(allocator, stream, uri, active_db);
+        return;
+    }
+
+    if (is_post and std.mem.startsWith(u8, uri, "/api/scan/periods/rebuild")) {
+        try handle_scan_period_rebuild(allocator, stream, uri, active_db);
         return;
     }
 
@@ -1671,15 +1483,15 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         return;
     }
 
-    if (is_post and std.mem.startsWith(u8, uri, "/api/backtest/tasks/") and std.mem.endsWith(u8, stripQuery(uri), "/cancel")) {
-        const rest = stripQuery(uri)["/api/backtest/tasks/".len..];
+    if (is_post and std.mem.startsWith(u8, uri, "/api/backtest/tasks/") and std.mem.endsWith(u8, http.stripQuery(uri), "/cancel")) {
+        const rest = http.stripQuery(uri)["/api/backtest/tasks/".len..];
         const task_id = rest[0 .. rest.len - "/cancel".len];
         try handle_backtest_task_cancel(allocator, stream, task_id);
         return;
     }
 
     if (!is_get) {
-        try respondError(allocator, stream, 405, "method not allowed");
+        try http.respondError(allocator, stream, 405, "method not allowed");
         return;
     }
 
@@ -1692,7 +1504,7 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     // GET /api/stock/{symbol}/...
     if (std.mem.startsWith(u8, uri, "/api/stock/")) {
         const rest_with_query = uri["/api/stock/".len..];
-        const rest = stripQuery(rest_with_query);
+        const rest = http.stripQuery(rest_with_query);
 
         if (std.mem.endsWith(u8, rest, "/basic")) {
             try handle_stock_basic(allocator, stream, rest[0 .. rest.len - "/basic".len]);
@@ -1740,6 +1552,22 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     }
 
     // GET /api/scan?top_n=N  (must check specific routes first)
+    if (std.mem.startsWith(u8, uri, "/api/scan/periods/")) {
+        const stripped = http.stripQuery(uri);
+        const rest = stripped["/api/scan/periods/".len..];
+        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
+            const period = rest[0..slash];
+            const period_start = rest[slash + 1 ..];
+            try handle_scan_period_detail(allocator, stream, period, period_start, active_db);
+            return;
+        }
+        try http.respondError(allocator, stream, 400, "invalid period detail path");
+        return;
+    }
+    if (std.mem.startsWith(u8, uri, "/api/scan/periods")) {
+        try handle_scan_periods_list(allocator, stream, uri, active_db);
+        return;
+    }
     if (std.mem.eql(u8, uri, "/api/scan/history")) {
         try handle_scan_history(allocator, stream, active_db);
         return;
@@ -1770,45 +1598,23 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         return;
     }
 
-    if (std.mem.eql(u8, stripQuery(uri), "/api/backtest/tasks")) {
+    if (std.mem.eql(u8, http.stripQuery(uri), "/api/backtest/tasks")) {
         try handle_backtest_task_list(allocator, stream, uri, db_path);
         return;
     }
 
     if (std.mem.startsWith(u8, uri, "/api/backtest/tasks/")) {
-        const task_id = stripQuery(uri)["/api/backtest/tasks/".len..];
+        const task_id = http.stripQuery(uri)["/api/backtest/tasks/".len..];
         try handle_backtest_task_get(allocator, stream, task_id, db_path);
         return;
     }
 
     if (std.mem.eql(u8, uri, "/api/health")) {
-        try respondJson(allocator, stream, 200, .{ .status = "ok" });
+        try http.respondJson(allocator, stream, 200, .{ .status = "ok" });
         return;
     }
 
-    try respondError(allocator, stream, 404, "Not found");
-}
-
-fn parseContentLength(headers: []const u8) usize {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    _ = lines.next();
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, ':')) |idx| {
-            const name = std.mem.trim(u8, line[0..idx], " \t");
-            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                const raw = std.mem.trim(u8, line[idx + 1 ..], " \t");
-                return std.fmt.parseInt(usize, raw, 10) catch 0;
-            }
-        }
-    }
-    return 0;
-}
-
-fn stripQuery(value: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, value, '?')) |idx| {
-        return value[0..idx];
-    }
-    return value;
+    try http.respondError(allocator, stream, 404, "Not found");
 }
 
 fn handle_backtest_task_create(
@@ -1819,19 +1625,19 @@ fn handle_backtest_task_create(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respondError(allocator, stream, 500, "database path is missing");
+        try http.respondError(allocator, stream, 500, "database path is missing");
         return;
     };
     backtest.validateRequest(allocator, body) catch |err| {
         std.debug.print("Backtest task validation error: {any}\n", .{err});
-        try respondError(allocator, stream, 400, "invalid backtest request");
+        try http.respondError(allocator, stream, 400, "invalid backtest request");
         return;
     };
 
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
-    const cache_key = makeBacktestResultCacheKey(allocator, body, db) catch |err| {
+    const cache_key = result_cache.makeKey(allocator, body, db) catch |err| {
         std.debug.print("Backtest cache key error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "failed to build backtest cache key");
+        try http.respondError(allocator, stream, 500, "failed to build backtest cache key");
         return;
     };
     defer allocator.free(cache_key);
@@ -1843,16 +1649,16 @@ fn handle_backtest_task_create(
         if (backtest_task_store.findActiveByCacheKeyLocked(cache_key)) |active| {
             const body_json = try renderBacktestTaskJsonLocked(allocator, active);
             defer allocator.free(body_json);
-            try respond(stream, 200, body_json);
+            try http.respond(stream, 200, body_json);
             return;
         }
     }
 
-    const cached_result = loadBacktestResultCache(allocator, workspace_dir, cache_key) catch null;
+    const cached_result = result_cache.load(allocator, workspace_dir, cache_key) catch null;
     const task = backtest_task_store.create(body, path, cache_key, cached_result) catch |err| {
         if (cached_result) |cached| allocator.free(cached);
         std.debug.print("Backtest task create error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "failed to create backtest task");
+        try http.respondError(allocator, stream, 500, "failed to create backtest task");
         return;
     };
 
@@ -1864,7 +1670,7 @@ fn handle_backtest_task_create(
             setBacktestTaskFailed(task, "failed to enqueue backtest task");
             const body_json = try renderBacktestTaskJsonLockedAfterLookup(allocator, task.id);
             defer allocator.free(body_json);
-            try respond(stream, 200, body_json);
+            try http.respond(stream, 200, body_json);
             return;
         };
         backtest_task_store.mutex.unlock();
@@ -1873,7 +1679,7 @@ fn handle_backtest_task_create(
 
     const body_json = try renderBacktestTaskJsonLockedAfterLookup(allocator, task.id);
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn renderBacktestTaskJsonLockedAfterLookup(allocator: std.mem.Allocator, task_id: []const u8) ![]u8 {
@@ -1891,22 +1697,22 @@ fn handle_backtest_task_get(
     db_path: ?[]const u8,
 ) !void {
     if (task_id.len == 0) {
-        try respondError(allocator, stream, 404, "backtest task not found");
+        try http.respondError(allocator, stream, 404, "backtest task not found");
         return;
     }
     const body_json = (try renderBacktestTaskJson(allocator, task_id)) orelse blk: {
         const path = db_path orelse {
-            try respondError(allocator, stream, 404, "backtest task not found");
+            try http.respondError(allocator, stream, 404, "backtest task not found");
             return;
         };
         const workspace_dir = std.fs.path.dirname(path) orelse ".";
-        break :blk (try loadPersistedBacktestTaskJson(allocator, workspace_dir, task_id)) orelse {
-            try respondError(allocator, stream, 404, "backtest task not found");
+        break :blk (try task_files.loadJson(allocator, workspace_dir, task_id, backtest_task_store.running_count, MAX_CONCURRENT_BACKTEST_TASKS)) orelse {
+            try http.respondError(allocator, stream, 404, "backtest task not found");
             return;
         };
     };
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn handle_backtest_task_list(
@@ -1916,14 +1722,14 @@ fn handle_backtest_task_list(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respondError(allocator, stream, 500, "database path is missing");
+        try http.respondError(allocator, stream, 500, "database path is missing");
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
     const limit = parsePositiveQueryInt(uri, "limit", 10, 50);
     const body_json = try listBacktestTasksJson(allocator, workspace_dir, limit);
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn handle_backtest_task_cancel(
@@ -1932,15 +1738,15 @@ fn handle_backtest_task_cancel(
     task_id: []const u8,
 ) !void {
     if (task_id.len == 0) {
-        try respondError(allocator, stream, 404, "backtest task not found");
+        try http.respondError(allocator, stream, 404, "backtest task not found");
         return;
     }
     const body_json = (try cancelBacktestTaskJson(allocator, task_id)) orelse {
-        try respondError(allocator, stream, 404, "backtest task not found");
+        try http.respondError(allocator, stream, 404, "backtest task not found");
         return;
     };
     defer allocator.free(body_json);
-    try respond(stream, 200, body_json);
+    try http.respond(stream, 200, body_json);
 }
 
 fn handle_backtest(
@@ -1951,33 +1757,33 @@ fn handle_backtest(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respondError(allocator, stream, 500, "database path is missing");
+        try http.respondError(allocator, stream, 500, "database path is missing");
         return;
     };
     const d = db orelse {
-        try respondError(allocator, stream, 500, "database is not available");
+        try http.respondError(allocator, stream, 500, "database is not available");
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
-    const cache_key = makeBacktestResultCacheKey(allocator, body, db) catch null;
+    const cache_key = result_cache.makeKey(allocator, body, db) catch null;
     defer if (cache_key) |key| allocator.free(key);
     if (cache_key) |key| {
-        if (loadBacktestResultCache(allocator, workspace_dir, key) catch null) |cached| {
+        if (result_cache.load(allocator, workspace_dir, key) catch null) |cached| {
             defer allocator.free(cached);
-            try respond(stream, 200, cached);
+            try http.respond(stream, 200, cached);
             return;
         }
     }
     const result = backtest.run(allocator, d, body, workspace_dir) catch |err| {
         std.debug.print("Backtest error: {any}\n", .{err});
-        try respondError(allocator, stream, 400, "backtest failed");
+        try http.respondError(allocator, stream, 400, "backtest failed");
         return;
     };
     defer allocator.free(result);
     if (cache_key) |key| {
-        saveBacktestResultCache(allocator, workspace_dir, key, result);
+        result_cache.save(allocator, workspace_dir, key, result);
     }
-    try respond(stream, 200, result);
+    try http.respond(stream, 200, result);
 }
 
 fn handle_backtest_history(
@@ -1986,17 +1792,17 @@ fn handle_backtest_history(
     db_path: ?[]const u8,
 ) !void {
     const path = db_path orelse {
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     const workspace_dir = std.fs.path.dirname(path) orelse ".";
     const result = backtest.history(allocator, workspace_dir) catch |err| {
         std.debug.print("Backtest history error: {any}\n", .{err});
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     defer allocator.free(result);
-    try respond(stream, 200, result);
+    try http.respond(stream, 200, result);
 }
 
 // ============================================================
@@ -2007,7 +1813,7 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
         std.debug.print("EastMoney error: {any}, trying Tencent\n", .{err});
         var t_info = tencent.getStockInfo(allocator, symbol) catch |err2| {
             std.debug.print("Tencent error: {any}\n", .{err2});
-            try respondError(allocator, stream, 500, "no data");
+            try http.respondError(allocator, stream, 500, "no data");
             return;
         };
         defer t_info.deinit(allocator);
@@ -2040,13 +1846,13 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
         try s.objectField("流通股");
         try writeNullableF64(&s, t_info.float_shares);
         try s.endObject();
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     };
     defer info.deinit(allocator);
 
     if (info.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -2081,7 +1887,7 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
     try s.objectField("上市时间");
     try s.write(info.list_date orelse "");
     try s.endObject();
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -2090,13 +1896,13 @@ fn handle_stock_basic(allocator: std.mem.Allocator, stream: std.net.Stream, symb
 fn handle_search(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8) !void {
     const q_str = if (std.mem.indexOf(u8, uri, "?q=")) |idx| uri[idx + 3 ..] else "";
     if (q_str.len == 0) {
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     }
 
     var result = eastmoney.searchStock(allocator, q_str) catch |err| {
         std.debug.print("Search error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "search failed");
+        try http.respondError(allocator, stream, 500, "search failed");
         return;
     };
     defer result.deinit(allocator);
@@ -2116,7 +1922,7 @@ fn handle_search(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []co
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -2127,7 +1933,7 @@ fn handle_stock_kline(allocator: std.mem.Allocator, stream: std.net.Stream, symb
     defer result.deinit(allocator);
 
     if (result.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -2154,25 +1960,12 @@ fn handle_stock_kline(allocator: std.mem.Allocator, stream: std.net.Stream, symb
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
 // Daily K-line with amount and change_pct
 // ============================================================
-fn queryParam(uri: []const u8, name: []const u8) ?[]const u8 {
-    const query_start = std.mem.indexOfScalar(u8, uri, '?') orelse return null;
-    const query = uri[query_start + 1 ..];
-    var iter = std.mem.splitScalar(u8, query, '&');
-    while (iter.next()) |part| {
-        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-        if (std.mem.eql(u8, part[0..eq], name)) {
-            return part[eq + 1 ..];
-        }
-    }
-    return null;
-}
-
 fn isSafeDate(s: []const u8) bool {
     if (s.len != 10) return false;
     for (s, 0..) |ch, idx| {
@@ -2870,8 +2663,8 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const start_date = queryParam(uri, "start_date");
-    const end_date = queryParam(uri, "end_date");
+    const start_date = http.queryParam(uri, "start_date");
+    const end_date = http.queryParam(uri, "end_date");
 
     var query = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
     defer query.deinit(aa);
@@ -2941,12 +2734,12 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
     return true;
 }
 
 fn parsePositiveQueryInt(uri: []const u8, name: []const u8, default_value: usize, max_value: usize) usize {
-    const raw = queryParam(uri, name) orelse return default_value;
+    const raw = http.queryParam(uri, name) orelse return default_value;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return default_value;
     if (parsed == 0) return default_value;
     return @min(parsed, max_value);
@@ -2980,14 +2773,14 @@ fn writeDailyBarsArray(stream: std.net.Stream, allocator: std.mem.Allocator, bar
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 fn handle_price_history(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: []const u8, uri: []const u8, db: ?*duckdb.Db) !void {
     const days = parsePositiveQueryInt(uri, "days", 30, 5000);
     const bars = loadDailyBars(allocator, db, symbol, days) catch |err| {
         std.debug.print("Price history error: {any}\n", .{err});
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     defer freeDailyBars(allocator, bars);
@@ -3010,13 +2803,13 @@ fn handle_daily_k(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: 
 
     var result = eastmoney.getDailyK(allocator, symbol, if (days > 0) days else 500) catch |err| {
         std.debug.print("Daily K error: {any}\n", .{err});
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
         return;
     };
     defer result.deinit(allocator);
 
     if (result.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -3047,7 +2840,7 @@ fn handle_daily_k(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: 
     }
     try s.endArray();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3058,7 +2851,7 @@ fn handle_stock_valuation(allocator: std.mem.Allocator, stream: std.net.Stream, 
     defer result.deinit(allocator);
 
     if (result.err_msg) |err| {
-        try respondError(allocator, stream, 500, err);
+        try http.respondError(allocator, stream, 500, err);
         return;
     }
 
@@ -3086,7 +2879,7 @@ fn handle_stock_valuation(allocator: std.mem.Allocator, stream: std.net.Stream, 
     try s.endArray();
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3332,7 +3125,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const raw_industry = queryParam(uri, "industry") orelse "";
+    const raw_industry = http.queryParam(uri, "industry") orelse "";
     const decoded_industry = if (raw_industry.len > 0) eastmoney.urlDecode(aa, raw_industry) catch raw_industry else "";
 
     var industry_name: []const u8 = decoded_industry;
@@ -3369,7 +3162,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
             try s.beginArray();
             try s.endArray();
             try s.endObject();
-            try respond(stream, 200, out.written());
+            try http.respond(stream, 200, out.written());
             return;
         };
         defer industry.deinit(allocator);
@@ -3433,7 +3226,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
         try s.endArray();
         try s.endObject();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     }
 
@@ -3467,7 +3260,7 @@ fn handle_stock_industry(allocator: std.mem.Allocator, stream: std.net.Stream, s
     try s.endArray();
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3479,7 +3272,7 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
         std.debug.print("EastMoney error: {any}, trying Tencent\n", .{err});
         var t_info = tencent.getStockInfo(allocator, symbol) catch |err2| {
             std.debug.print("Tencent error: {any}\n", .{err2});
-            try respondJson(allocator, stream, 200, .{ .symbol = symbol });
+            try http.respondJson(allocator, stream, 200, .{ .symbol = symbol });
             return;
         };
         defer t_info.deinit(allocator);
@@ -3535,7 +3328,7 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
         try s.endArray();
         try s.endObject();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     };
     defer info.deinit(allocator);
@@ -3625,7 +3418,7 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
 
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3643,7 +3436,7 @@ fn handle_stock_profile(allocator: std.mem.Allocator, stream: std.net.Stream, sy
             defer out.deinit();
             var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
             try writeProfileObject(&s, symbol, symbol, "", "", profile);
-            try respond(stream, 200, out.written());
+            try http.respond(stream, 200, out.written());
             return;
         };
         defer t_info.deinit(allocator);
@@ -3652,7 +3445,7 @@ fn handle_stock_profile(allocator: std.mem.Allocator, stream: std.net.Stream, sy
         defer out.deinit();
         var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
         try writeProfileObject(&s, t_info.symbol, t_info.name, "", "", profile);
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
         return;
     };
     defer info.deinit(allocator);
@@ -3661,7 +3454,7 @@ fn handle_stock_profile(allocator: std.mem.Allocator, stream: std.net.Stream, sy
     defer out.deinit();
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
     try writeProfileObject(&s, info.symbol, info.name, info.industry orelse "", info.list_date orelse "", profile);
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3701,7 +3494,7 @@ fn handle_stock_technical(allocator: std.mem.Allocator, stream: std.net.Stream, 
     defer out.deinit();
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
     try writeTechnicalObject(&s, technical);
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3712,14 +3505,14 @@ fn handle_futures(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []c
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const raw_industry = queryParam(uri, "industry") orelse "";
+    const raw_industry = http.queryParam(uri, "industry") orelse "";
     const industry_name = if (raw_industry.len > 0) eastmoney.urlDecode(aa, raw_industry) catch raw_industry else "";
 
     var out = std.io.Writer.Allocating.init(allocator);
     defer out.deinit();
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
     try writeFuturesAnalysisObject(&s, allocator, industry_name);
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 // ============================================================
@@ -3997,6 +3790,335 @@ fn runMarketScan(allocator: std.mem.Allocator, db: ?*duckdb.Db, top_n: u16) !Mar
     };
 }
 
+fn isSafeScanPeriod(value: []const u8) bool {
+    return std.mem.eql(u8, value, "week") or
+        std.mem.eql(u8, value, "month") or
+        std.mem.eql(u8, value, "quarter");
+}
+
+fn scanPeriodTrunc(value: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, value, "week")) return "week";
+    if (std.mem.eql(u8, value, "month")) return "month";
+    if (std.mem.eql(u8, value, "quarter")) return "quarter";
+    return error.InvalidScanPeriod;
+}
+
+fn scanPeriodEndExpr(allocator: std.mem.Allocator, period: []const u8, period_start: []const u8) ![]u8 {
+    if (std.mem.eql(u8, period, "week")) {
+        return std.fmt.allocPrint(allocator, "DATE '{s}' + INTERVAL 6 DAY", .{period_start});
+    }
+    if (std.mem.eql(u8, period, "month")) {
+        return std.fmt.allocPrint(allocator, "DATE '{s}' + INTERVAL 1 MONTH - INTERVAL 1 DAY", .{period_start});
+    }
+    if (std.mem.eql(u8, period, "quarter")) {
+        return std.fmt.allocPrint(allocator, "DATE '{s}' + INTERVAL 3 MONTH - INTERVAL 1 DAY", .{period_start});
+    }
+    return error.InvalidScanPeriod;
+}
+
+fn resolveScanDataDate(allocator: std.mem.Allocator, d: *duckdb.Db, scan_date: []const u8, preferred_data_date: ?[]const u8) ![]const u8 {
+    if (preferred_data_date) |value| {
+        if (isSafeDate(value)) return allocator.dupe(u8, value);
+    }
+    if (!isSafeDate(scan_date)) return error.InvalidDate;
+
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT CAST(COALESCE(MAX(date), DATE '{s}') AS VARCHAR) AS data_date FROM daily_k WHERE date <= DATE '{s}'",
+        .{ scan_date, scan_date },
+    );
+    defer allocator.free(query);
+    return querySingleString(allocator, d, query, scan_date);
+}
+
+fn resolvePeriodStartForDate(allocator: std.mem.Allocator, d: *duckdb.Db, period: []const u8, data_date: []const u8) ![]const u8 {
+    if (!isSafeDate(data_date)) return error.InvalidDate;
+    const trunc = try scanPeriodTrunc(period);
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT CAST(date_trunc('{s}', DATE '{s}') AS DATE)::VARCHAR AS period_start",
+        .{ trunc, data_date },
+    );
+    defer allocator.free(query);
+    return querySingleString(allocator, d, query, data_date);
+}
+
+fn rebuildScanPeriodSnapshot(
+    allocator: std.mem.Allocator,
+    d: *duckdb.Db,
+    period: []const u8,
+    period_start: []const u8,
+    top_n: u16,
+) !void {
+    if (!isSafeScanPeriod(period)) return error.InvalidScanPeriod;
+    if (!isSafeDate(period_start)) return error.InvalidDate;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const trunc = try scanPeriodTrunc(period);
+    const period_end_expr = try scanPeriodEndExpr(aa, period, period_start);
+
+    const del_stocks = try std.fmt.allocPrint(
+        aa,
+        "DELETE FROM scan_period_stock WHERE period = '{s}' AND period_start = DATE '{s}'",
+        .{ period, period_start },
+    );
+    try d.exec(del_stocks);
+    const del_result = try std.fmt.allocPrint(
+        aa,
+        "DELETE FROM scan_period_result WHERE period = '{s}' AND period_start = DATE '{s}'",
+        .{ period, period_start },
+    );
+    try d.exec(del_result);
+
+    const insert_result = try std.fmt.allocPrint(
+        aa,
+        \\INSERT OR REPLACE INTO scan_period_result (
+        \\    period, period_start, period_end, top_n, candidate_count, scan_days,
+        \\    data_start, data_end, is_current, updated_at
+        \\)
+        \\WITH period_bounds AS (
+        \\    SELECT DATE '{s}' AS period_start, CAST(({s}) AS DATE) AS period_end
+        \\),
+        \\scan_base AS (
+        \\    SELECT
+        \\        sr.scan_date,
+        \\        COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date) AS data_date,
+        \\        GREATEST(COALESCE(sr.top_n, 100), 1) AS daily_top_n,
+        \\        ss.symbol
+        \\    FROM scan_result sr
+        \\    JOIN scan_stock ss ON ss.scan_date = sr.scan_date
+        \\    JOIN period_bounds pb ON TRUE
+        \\    WHERE COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date)
+        \\          BETWEEN pb.period_start AND pb.period_end
+        \\),
+        \\chosen_scan_dates AS (
+        \\    SELECT data_date, scan_date
+        \\    FROM (
+        \\        SELECT
+        \\            data_date,
+        \\            scan_date,
+        \\            ROW_NUMBER() OVER (
+        \\                PARTITION BY data_date
+        \\                ORDER BY CASE WHEN scan_date = data_date THEN 0 ELSE 1 END, scan_date DESC
+        \\            ) AS scan_choice
+        \\        FROM scan_base
+        \\        GROUP BY data_date, scan_date
+        \\    )
+        \\    WHERE scan_choice = 1
+        \\),
+        \\period_base AS (
+        \\    SELECT b.*
+        \\    FROM scan_base b
+        \\    JOIN chosen_scan_dates c ON c.data_date = b.data_date AND c.scan_date = b.scan_date
+        \\),
+        \\period_days AS (
+        \\    SELECT COUNT(DISTINCT data_date) AS scan_days, MIN(data_date) AS data_start, MAX(data_date) AS data_end
+        \\    FROM period_base
+        \\),
+        \\candidate_stats AS (
+        \\    SELECT COUNT(DISTINCT symbol) AS candidate_count
+        \\    FROM period_base
+        \\)
+        \\SELECT
+        \\    '{s}' AS period,
+        \\    pb.period_start,
+        \\    pb.period_end,
+        \\    {d} AS top_n,
+        \\    cs.candidate_count,
+        \\    pd.scan_days,
+        \\    pd.data_start,
+        \\    pd.data_end,
+        \\    pb.period_start = CAST(date_trunc('{s}', CURRENT_DATE) AS DATE) AS is_current,
+        \\    CURRENT_TIMESTAMP AS updated_at
+        \\FROM period_bounds pb, period_days pd, candidate_stats cs
+        \\WHERE pd.scan_days > 0
+    , .{ period_start, period_end_expr, period, top_n, trunc });
+    try d.exec(insert_result);
+
+    const insert_stocks = try std.fmt.allocPrint(
+        aa,
+        \\INSERT OR REPLACE INTO scan_period_stock (
+        \\    period, period_start, rank, symbol, name, industry, period_score,
+        \\    appearances, best_rank, avg_rank, avg_daily_score, score_delta, return_pct,
+        \\    first_seen_date, latest_seen_date, latest_price, latest_change_pct
+        \\)
+        \\WITH period_bounds AS (
+        \\    SELECT DATE '{s}' AS period_start, CAST(({s}) AS DATE) AS period_end
+        \\),
+        \\scan_base AS (
+        \\    SELECT
+        \\        sr.scan_date,
+        \\        COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date) AS data_date,
+        \\        CAST(GREATEST(COALESCE(sr.top_n, 100), 1) AS DOUBLE) AS daily_top_n,
+        \\        ss.rank,
+        \\        ss.symbol,
+        \\        ss.name,
+        \\        ss.price,
+        \\        ss.change_pct,
+        \\        ss.score,
+        \\        COALESCE(ss.industry, '') AS industry
+        \\    FROM scan_result sr
+        \\    JOIN scan_stock ss ON ss.scan_date = sr.scan_date
+        \\    JOIN period_bounds pb ON TRUE
+        \\    WHERE COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date)
+        \\          BETWEEN pb.period_start AND pb.period_end
+        \\),
+        \\chosen_scan_dates AS (
+        \\    SELECT data_date, scan_date
+        \\    FROM (
+        \\        SELECT
+        \\            data_date,
+        \\            scan_date,
+        \\            ROW_NUMBER() OVER (
+        \\                PARTITION BY data_date
+        \\                ORDER BY CASE WHEN scan_date = data_date THEN 0 ELSE 1 END, scan_date DESC
+        \\            ) AS scan_choice
+        \\        FROM scan_base
+        \\        GROUP BY data_date, scan_date
+        \\    )
+        \\    WHERE scan_choice = 1
+        \\),
+        \\period_base AS (
+        \\    SELECT b.*
+        \\    FROM scan_base b
+        \\    JOIN chosen_scan_dates c ON c.data_date = b.data_date AND c.scan_date = b.scan_date
+        \\),
+        \\period_days AS (
+        \\    SELECT COUNT(DISTINCT data_date) AS scan_days
+        \\    FROM period_base
+        \\),
+        \\agg AS (
+        \\    SELECT
+        \\        symbol,
+        \\        arg_max(name, data_date) AS name,
+        \\        arg_max(industry, data_date) AS industry,
+        \\        COUNT(DISTINCT data_date) AS appearances,
+        \\        MIN(rank) AS best_rank,
+        \\        AVG(CAST(rank AS DOUBLE)) AS avg_rank,
+        \\        AVG((daily_top_n + 1.0 - CAST(rank AS DOUBLE)) * 100.0 / daily_top_n) AS rank_score,
+        \\        AVG(score) AS avg_daily_score,
+        \\        arg_min(score, data_date) AS first_score,
+        \\        arg_max(score, data_date) AS latest_score,
+        \\        MIN(data_date) AS first_seen_date,
+        \\        MAX(data_date) AS latest_seen_date,
+        \\        arg_min(price, data_date) AS first_scan_price,
+        \\        arg_max(price, data_date) AS latest_scan_price,
+        \\        arg_max(change_pct, data_date) AS latest_change_pct
+        \\    FROM period_base
+        \\    GROUP BY symbol
+        \\),
+        \\priced AS (
+        \\    SELECT
+        \\        a.*,
+        \\        COALESCE(first_k.close, a.first_scan_price) AS first_price,
+        \\        COALESCE(latest_k.close, a.latest_scan_price) AS latest_price
+        \\    FROM agg a
+        \\    LEFT JOIN daily_k first_k ON first_k.symbol = a.symbol AND first_k.date = a.first_seen_date
+        \\    LEFT JOIN daily_k latest_k ON latest_k.symbol = a.symbol AND latest_k.date = a.latest_seen_date
+        \\),
+        \\scored AS (
+        \\    SELECT
+        \\        p.*,
+        \\        CASE
+        \\            WHEN p.first_price IS NULL OR p.first_price = 0 OR p.latest_price IS NULL THEN 0
+        \\            ELSE (p.latest_price - p.first_price) / p.first_price * 100.0
+        \\        END AS return_pct,
+        \\        p.latest_score - p.first_score AS score_delta,
+        \\        pd.scan_days
+        \\    FROM priced p, period_days pd
+        \\),
+        \\ranked AS (
+        \\    SELECT
+        \\        *,
+        \\        30.0 * CAST(appearances AS DOUBLE) / NULLIF(CAST(scan_days AS DOUBLE), 0.0)
+        \\        + 25.0 * rank_score / 100.0
+        \\        + 20.0 * avg_daily_score / 100.0
+        \\        + 15.0 * LEAST(100.0, GREATEST(0.0, (return_pct + 10.0) / 30.0 * 100.0)) / 100.0
+        \\        + 10.0 * LEAST(100.0, GREATEST(0.0, (score_delta + 20.0) / 40.0 * 100.0)) / 100.0 AS period_score
+        \\    FROM scored
+        \\    WHERE scan_days > 0
+        \\)
+        \\SELECT
+        \\    '{s}' AS period,
+        \\    DATE '{s}' AS period_start,
+        \\    ROW_NUMBER() OVER (
+        \\        ORDER BY period_score DESC, appearances DESC, return_pct DESC, latest_score DESC, symbol ASC
+        \\    ) AS rank,
+        \\    symbol,
+        \\    name,
+        \\    industry,
+        \\    period_score,
+        \\    appearances,
+        \\    best_rank,
+        \\    avg_rank,
+        \\    avg_daily_score,
+        \\    score_delta,
+        \\    return_pct,
+        \\    first_seen_date,
+        \\    latest_seen_date,
+        \\    latest_price,
+        \\    latest_change_pct
+        \\FROM ranked
+        \\ORDER BY period_score DESC, appearances DESC, return_pct DESC, latest_score DESC, symbol ASC
+        \\LIMIT {d}
+    , .{ period_start, period_end_expr, period, period_start, top_n });
+    try d.exec(insert_stocks);
+}
+
+fn rebuildScanPeriodSnapshotsForDataDate(allocator: std.mem.Allocator, d: *duckdb.Db, data_date: []const u8, top_n: u16) !void {
+    const periods = [_][]const u8{ "week", "month", "quarter" };
+    for (periods) |period| {
+        const period_start = try resolvePeriodStartForDate(allocator, d, period, data_date);
+        defer allocator.free(period_start);
+        try rebuildScanPeriodSnapshot(allocator, d, period, period_start, top_n);
+    }
+}
+
+fn rebuildScanPeriodSnapshots(allocator: std.mem.Allocator, d: *duckdb.Db, requested_period: []const u8, top_n: u16) !usize {
+    if (std.mem.eql(u8, requested_period, "all")) {
+        var total: usize = 0;
+        total += try rebuildScanPeriodSnapshots(allocator, d, "week", top_n);
+        total += try rebuildScanPeriodSnapshots(allocator, d, "month", top_n);
+        total += try rebuildScanPeriodSnapshots(allocator, d, "quarter", top_n);
+        return total;
+    }
+    if (!isSafeScanPeriod(requested_period)) return error.InvalidScanPeriod;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const trunc = try scanPeriodTrunc(requested_period);
+    const query = try std.fmt.allocPrint(
+        aa,
+        \\WITH scan_dates AS (
+        \\    SELECT DISTINCT
+        \\        COALESCE(data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= scan_date), scan_date) AS data_date
+        \\    FROM scan_result
+        \\)
+        \\SELECT DISTINCT CAST(date_trunc('{s}', data_date) AS DATE)::VARCHAR AS period_start
+        \\FROM scan_dates
+        \\WHERE data_date IS NOT NULL
+        \\ORDER BY period_start
+    , .{trunc});
+
+    var rows = try d.queryRows(allocator, query);
+    defer rows.deinit(allocator);
+
+    var count: usize = 0;
+    var r: usize = 0;
+    while (r < rows.rows.items.len) : (r += 1) {
+        const period_start = rows.getStr(r, "period_start") orelse continue;
+        if (!isSafeDate(period_start)) continue;
+        try rebuildScanPeriodSnapshot(allocator, d, requested_period, period_start, top_n);
+        count += 1;
+    }
+    return count;
+}
+
 fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
     var top_n: u16 = 100;
     if (std.mem.indexOf(u8, uri, "?")) |idx| {
@@ -4009,7 +4131,7 @@ fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []cons
 
     var scan = runMarketScan(allocator, db, top_n) catch |err| {
         std.debug.print("Scan error: {any}\n", .{err});
-        try respondError(allocator, stream, 500, "scan failed");
+        try http.respondError(allocator, stream, 500, "scan failed");
         return;
     };
     defer scan.deinit(allocator);
@@ -4018,7 +4140,7 @@ fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []cons
         const scan_date = currentDbDate(allocator, d) catch null;
         defer if (scan_date) |value| allocator.free(value);
         if (scan_date) |value| {
-            saveScanToDb(d, allocator, value, top_n, scan.items) catch |err| {
+            saveScanToDb(d, allocator, value, top_n, scan.items, scan.data_date, scan.source, scan.coverage_count) catch |err| {
                 std.debug.print("DuckDB save error: {any}\n", .{err});
             };
         }
@@ -4066,7 +4188,7 @@ fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []cons
     try s.write(scan.coverage_count);
     try s.endObject();
 
-    try respond(stream, 200, out.written());
+    try http.respond(stream, 200, out.written());
 }
 
 fn saveScanToDb(
@@ -4075,30 +4197,41 @@ fn saveScanToDb(
     scan_date: []const u8,
     top_n: u16,
     items: []const ScoredStock,
+    data_date: ?[]const u8,
+    source: []const u8,
+    coverage_count: usize,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
+    const effective_data_date = try resolveScanDataDate(allocator, d, scan_date, data_date);
+    defer allocator.free(effective_data_date);
+    const escaped_source = try sql_text.escape(aa, source);
+
     const insert_scan = try std.fmt.allocPrint(
         aa,
-        "INSERT OR REPLACE INTO scan_result (scan_date, top_n, total_stocks) VALUES ('{s}', {d}, {d})",
-        .{ scan_date, top_n, items.len },
+        \\INSERT OR REPLACE INTO scan_result
+        \\    (scan_date, top_n, total_stocks, data_date, source, coverage_count, created_at)
+        \\VALUES
+        \\    ('{s}', {d}, {d}, '{s}', '{s}', {d}, COALESCE((SELECT created_at FROM scan_result WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}' LIMIT 1), CURRENT_TIMESTAMP))
+    ,
+        .{ scan_date, top_n, items.len, effective_data_date, escaped_source, coverage_count, scan_date, scan_date },
     );
     try d.exec(insert_scan);
 
     const del = try std.fmt.allocPrint(
         aa,
-        "DELETE FROM scan_stock WHERE scan_date = '{s}'",
-        .{scan_date},
+        "DELETE FROM scan_stock WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}'",
+        .{ scan_date, scan_date },
     );
     try d.exec(del);
 
     var i: usize = 0;
     while (i < items.len) : (i += 1) {
         const rank = i + 1;
-        const escaped_name = try sqlEscape(aa, items[i].name);
-        const escaped_industry = try sqlEscape(aa, items[i].industry);
+        const escaped_name = try sql_text.escape(aa, items[i].name);
+        const escaped_industry = try sql_text.escape(aa, items[i].industry);
 
         const insert_stock = try std.fmt.allocPrint(
             aa,
@@ -4107,6 +4240,8 @@ fn saveScanToDb(
         );
         try d.exec(insert_stock);
     }
+
+    try rebuildScanPeriodSnapshotsForDataDate(allocator, d, effective_data_date, top_n);
 }
 
 // ============================================================
@@ -4114,9 +4249,21 @@ fn saveScanToDb(
 // ============================================================
 fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db: ?*duckdb.Db) !void {
     if (db) |d| {
-        var result = d.queryRows(allocator, "SELECT CAST(scan_date AS VARCHAR) AS scan_date, top_n, total_stocks, CAST(created_at AS VARCHAR) as created_at FROM scan_result ORDER BY scan_date DESC LIMIT 100") catch |err| {
+        var result = d.queryRows(allocator,
+            \\SELECT
+            \\    CAST(scan_date AS VARCHAR) AS scan_date,
+            \\    CAST(COALESCE(data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= scan_result.scan_date), scan_date) AS VARCHAR) AS data_date,
+            \\    top_n,
+            \\    total_stocks,
+            \\    COALESCE(source, '') AS source,
+            \\    COALESCE(coverage_count, 0) AS coverage_count,
+            \\    CAST(created_at AS VARCHAR) as created_at
+            \\FROM scan_result
+            \\ORDER BY scan_date DESC
+            \\LIMIT 100
+        ) catch |err| {
             std.debug.print("DuckDB query error: {any}\n", .{err});
-            try respond(stream, 200, "[]");
+            try http.respond(stream, 200, "[]");
             return;
         };
         defer result.deinit(allocator);
@@ -4131,40 +4278,69 @@ fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db:
             try s.beginObject();
             try s.objectField("scan_date");
             try s.write(result.getStr(r, "scan_date") orelse "");
+            try s.objectField("data_date");
+            try s.write(result.getStr(r, "data_date") orelse "");
             try s.objectField("top_n");
             try s.write(result.getF64(r, "top_n") orelse 0);
             try s.objectField("total_stocks");
             try s.write(result.getF64(r, "total_stocks") orelse 0);
+            try s.objectField("source");
+            try s.write(result.getStr(r, "source") orelse "");
+            try s.objectField("coverage_count");
+            try s.write(result.getF64(r, "coverage_count") orelse 0);
             try s.objectField("created_at");
             try s.write(result.getStr(r, "created_at") orelse "");
             try s.endObject();
         }
         try s.endArray();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
     } else {
-        try respond(stream, 200, "[]");
+        try http.respond(stream, 200, "[]");
     }
 }
 
 // ============================================================
 // Scan history detail
 // ============================================================
+fn buildScanHistoryDetailQuery(allocator: std.mem.Allocator, date_str: []const u8) ![]u8 {
+    if (!isSafeDate(date_str)) return error.InvalidDate;
+    return std.fmt.allocPrint(
+        allocator,
+        \\WITH scan_bound AS (
+        \\    SELECT COALESCE(total_stocks, top_n, 2147483647) AS max_rank
+        \\    FROM scan_result
+        \\    WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}'
+        \\    ORDER BY scan_date DESC
+        \\    LIMIT 1
+        \\)
+        \\SELECT rank, symbol, name, price, change_pct, score, industry
+        \\FROM scan_stock
+        \\WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}'
+        \\  AND rank <= COALESCE((SELECT max_rank FROM scan_bound), 2147483647)
+        \\ORDER BY rank
+    ,
+        .{ date_str, date_str, date_str, date_str },
+    );
+}
+
 fn handle_scan_history_detail(allocator: std.mem.Allocator, stream: std.net.Stream, date_str: []const u8, db: ?*duckdb.Db) !void {
     if (db) |d| {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
 
-        const query = try std.fmt.allocPrint(
-            aa,
-            "SELECT rank, symbol, name, price, change_pct, score, industry FROM scan_stock WHERE scan_date = '{s}' ORDER BY rank",
-            .{date_str},
-        );
+        const query = buildScanHistoryDetailQuery(aa, date_str) catch |err| switch (err) {
+            error.InvalidDate => {
+                try http.respondError(allocator, stream, 400, "invalid scan date");
+                return;
+            },
+            else => return err,
+        };
 
         var result = d.queryRows(allocator, query) catch |err| {
             std.debug.print("DuckDB query error: {any}\n", .{err});
-            try respond(stream, 200, "{\"stocks\":[]}");
+            try http.respond(stream, 200, "{\"stocks\":[]}");
             return;
         };
         defer result.deinit(allocator);
@@ -4200,9 +4376,258 @@ fn handle_scan_history_detail(allocator: std.mem.Allocator, stream: std.net.Stre
         try s.endArray();
         try s.endObject();
 
-        try respond(stream, 200, out.written());
+        try http.respond(stream, 200, out.written());
     } else {
-        try respond(stream, 200, "{\"stocks\":[]}");
+        try http.respond(stream, 200, "{\"stocks\":[]}");
+    }
+}
+
+fn handle_scan_periods_list(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
+    const period = http.queryParam(uri, "period") orelse "week";
+    if (!isSafeScanPeriod(period)) {
+        try http.respondError(allocator, stream, 400, "invalid period");
+        return;
+    }
+    const limit = parsePositiveQueryInt(uri, "limit", 100, 500);
+
+    if (db) |d| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const query = try std.fmt.allocPrint(
+            aa,
+            \\SELECT
+            \\    period,
+            \\    CAST(period_start AS VARCHAR) AS period_start,
+            \\    CAST(period_end AS VARCHAR) AS period_end,
+            \\    top_n,
+            \\    candidate_count,
+            \\    scan_days,
+            \\    CAST(data_start AS VARCHAR) AS data_start,
+            \\    CAST(data_end AS VARCHAR) AS data_end,
+            \\    is_current,
+            \\    CAST(updated_at AS VARCHAR) AS updated_at
+            \\FROM scan_period_result
+            \\WHERE period = '{s}'
+            \\ORDER BY period_start DESC
+            \\LIMIT {d}
+        , .{ period, limit });
+
+        var result = d.queryRows(allocator, query) catch |err| {
+            std.debug.print("DuckDB period list query error: {any}\n", .{err});
+            try http.respond(stream, 200, "[]");
+            return;
+        };
+        defer result.deinit(allocator);
+
+        var out = std.io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+
+        try s.beginArray();
+        var r: usize = 0;
+        while (r < result.rows.items.len) : (r += 1) {
+            try s.beginObject();
+            try s.objectField("period");
+            try s.write(result.getStr(r, "period") orelse period);
+            try s.objectField("period_start");
+            try s.write(result.getStr(r, "period_start") orelse "");
+            try s.objectField("period_end");
+            try s.write(result.getStr(r, "period_end") orelse "");
+            try s.objectField("top_n");
+            try s.write(result.getF64(r, "top_n") orelse 0);
+            try s.objectField("candidate_count");
+            try s.write(result.getF64(r, "candidate_count") orelse 0);
+            try s.objectField("scan_days");
+            try s.write(result.getF64(r, "scan_days") orelse 0);
+            try s.objectField("data_start");
+            try s.write(result.getStr(r, "data_start") orelse "");
+            try s.objectField("data_end");
+            try s.write(result.getStr(r, "data_end") orelse "");
+            try s.objectField("is_current");
+            try s.write(parseBoolish(result.getStr(r, "is_current") orelse "false"));
+            try s.objectField("updated_at");
+            try s.write(result.getStr(r, "updated_at") orelse "");
+            try s.endObject();
+        }
+        try s.endArray();
+        try http.respond(stream, 200, out.written());
+    } else {
+        try http.respond(stream, 200, "[]");
+    }
+}
+
+fn handle_scan_period_detail(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    period: []const u8,
+    period_start: []const u8,
+    db: ?*duckdb.Db,
+) !void {
+    if (!isSafeScanPeriod(period) or !isSafeDate(period_start)) {
+        try http.respondError(allocator, stream, 400, "invalid period");
+        return;
+    }
+
+    if (db) |d| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const summary_query = try std.fmt.allocPrint(
+            aa,
+            \\SELECT
+            \\    period,
+            \\    CAST(period_start AS VARCHAR) AS period_start,
+            \\    CAST(period_end AS VARCHAR) AS period_end,
+            \\    top_n,
+            \\    candidate_count,
+            \\    scan_days,
+            \\    CAST(data_start AS VARCHAR) AS data_start,
+            \\    CAST(data_end AS VARCHAR) AS data_end,
+            \\    is_current,
+            \\    CAST(updated_at AS VARCHAR) AS updated_at
+            \\FROM scan_period_result
+            \\WHERE period = '{s}' AND period_start = DATE '{s}'
+        , .{ period, period_start });
+        var summary = d.queryRows(allocator, summary_query) catch |err| {
+            std.debug.print("DuckDB period detail summary error: {any}\n", .{err});
+            try http.respond(stream, 200, "{\"stocks\":[]}");
+            return;
+        };
+        defer summary.deinit(allocator);
+
+        const stocks_query = try std.fmt.allocPrint(
+            aa,
+            \\SELECT
+            \\    rank,
+            \\    symbol,
+            \\    name,
+            \\    industry,
+            \\    period_score,
+            \\    appearances,
+            \\    best_rank,
+            \\    avg_rank,
+            \\    avg_daily_score,
+            \\    score_delta,
+            \\    return_pct,
+            \\    CAST(first_seen_date AS VARCHAR) AS first_seen_date,
+            \\    CAST(latest_seen_date AS VARCHAR) AS latest_seen_date,
+            \\    latest_price,
+            \\    latest_change_pct
+            \\FROM scan_period_stock
+            \\WHERE period = '{s}' AND period_start = DATE '{s}'
+            \\ORDER BY rank
+        , .{ period, period_start });
+        var stocks = d.queryRows(allocator, stocks_query) catch |err| {
+            std.debug.print("DuckDB period detail stock error: {any}\n", .{err});
+            try http.respond(stream, 200, "{\"stocks\":[]}");
+            return;
+        };
+        defer stocks.deinit(allocator);
+
+        var out = std.io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+
+        const has_summary = summary.rows.items.len > 0;
+        try s.beginObject();
+        try s.objectField("period");
+        try s.write(if (has_summary) summary.getStr(0, "period") orelse period else period);
+        try s.objectField("period_start");
+        try s.write(if (has_summary) summary.getStr(0, "period_start") orelse period_start else period_start);
+        try s.objectField("period_end");
+        try s.write(if (has_summary) summary.getStr(0, "period_end") orelse "" else "");
+        try s.objectField("top_n");
+        try s.write(if (has_summary) summary.getF64(0, "top_n") orelse 0 else 0);
+        try s.objectField("candidate_count");
+        try s.write(if (has_summary) summary.getF64(0, "candidate_count") orelse 0 else 0);
+        try s.objectField("scan_days");
+        try s.write(if (has_summary) summary.getF64(0, "scan_days") orelse 0 else 0);
+        try s.objectField("data_start");
+        try s.write(if (has_summary) summary.getStr(0, "data_start") orelse "" else "");
+        try s.objectField("data_end");
+        try s.write(if (has_summary) summary.getStr(0, "data_end") orelse "" else "");
+        try s.objectField("is_current");
+        try s.write(if (has_summary) parseBoolish(summary.getStr(0, "is_current") orelse "false") else false);
+        try s.objectField("updated_at");
+        try s.write(if (has_summary) summary.getStr(0, "updated_at") orelse "" else "");
+        try s.objectField("stocks");
+        try s.beginArray();
+        var r: usize = 0;
+        while (r < stocks.rows.items.len) : (r += 1) {
+            try s.beginObject();
+            try s.objectField("rank");
+            try s.write(stocks.getF64(r, "rank") orelse 0);
+            try s.objectField("symbol");
+            try s.write(stocks.getStr(r, "symbol") orelse "");
+            try s.objectField("name");
+            try s.write(stocks.getStr(r, "name") orelse "");
+            try s.objectField("industry");
+            try s.write(stocks.getStr(r, "industry") orelse "");
+            try s.objectField("period_score");
+            try s.write(stocks.getF64(r, "period_score") orelse 0);
+            try s.objectField("appearances");
+            try s.write(stocks.getF64(r, "appearances") orelse 0);
+            try s.objectField("best_rank");
+            try s.write(stocks.getF64(r, "best_rank") orelse 0);
+            try s.objectField("avg_rank");
+            try s.write(stocks.getF64(r, "avg_rank") orelse 0);
+            try s.objectField("avg_daily_score");
+            try s.write(stocks.getF64(r, "avg_daily_score") orelse 0);
+            try s.objectField("score_delta");
+            try s.write(stocks.getF64(r, "score_delta") orelse 0);
+            try s.objectField("return_pct");
+            try s.write(stocks.getF64(r, "return_pct") orelse 0);
+            try s.objectField("first_seen_date");
+            try s.write(stocks.getStr(r, "first_seen_date") orelse "");
+            try s.objectField("latest_seen_date");
+            try s.write(stocks.getStr(r, "latest_seen_date") orelse "");
+            try s.objectField("latest_price");
+            try s.write(stocks.getF64(r, "latest_price") orelse 0);
+            try s.objectField("latest_change_pct");
+            try s.write(stocks.getF64(r, "latest_change_pct") orelse 0);
+            try s.endObject();
+        }
+        try s.endArray();
+        try s.endObject();
+        try http.respond(stream, 200, out.written());
+    } else {
+        try http.respond(stream, 200, "{\"stocks\":[]}");
+    }
+}
+
+fn handle_scan_period_rebuild(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
+    const period = http.queryParam(uri, "period") orelse "all";
+    if (!std.mem.eql(u8, period, "all") and !isSafeScanPeriod(period)) {
+        try http.respondError(allocator, stream, 400, "invalid period");
+        return;
+    }
+    const top_n_usize = parsePositiveQueryInt(uri, "top_n", 100, 500);
+    const top_n: u16 = @intCast(top_n_usize);
+
+    if (db) |d| {
+        const rebuilt = rebuildScanPeriodSnapshots(allocator, d, period, top_n) catch |err| {
+            std.debug.print("DuckDB period rebuild error: {any}\n", .{err});
+            try http.respondError(allocator, stream, 500, "period rebuild failed");
+            return;
+        };
+
+        var out = std.io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+        try s.beginObject();
+        try s.objectField("period");
+        try s.write(period);
+        try s.objectField("top_n");
+        try s.write(top_n);
+        try s.objectField("rebuilt");
+        try s.write(rebuilt);
+        try s.endObject();
+        try http.respond(stream, 200, out.written());
+    } else {
+        try http.respondError(allocator, stream, 500, "database unavailable");
     }
 }
 
@@ -4220,43 +4645,112 @@ fn handle_factors(stream: std.net.Stream) !void {
         \\{"name":"ma_deviation_20","category":"technical","description":"价格偏离MA20百分比","higher_is_better":true}
         \\]
     ;
-    try respond(stream, 200, body);
+    try http.respond(stream, 200, body);
 }
 
-// ============================================================
-// Response helpers
-// ============================================================
-fn respondJson(allocator: std.mem.Allocator, stream: std.net.Stream, status: u16, value: anytype) !void {
-    const body = try std.json.Stringify.valueAlloc(allocator, value, .{});
-    defer allocator.free(body);
-    try respond(stream, status, body);
-}
+test "weekly scan period rebuild deduplicates repeated trading dates" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/akshare_period_scan_test.db";
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
 
-fn respondError(allocator: std.mem.Allocator, stream: std.net.Stream, status: u16, msg: []const u8) !void {
-    const E = struct { err: []const u8 };
-    const body = try std.json.Stringify.valueAlloc(allocator, E{ .err = msg }, .{});
-    defer allocator.free(body);
-    try respond(stream, status, body);
-}
+    var db = try duckdb.Db.open(allocator, db_path);
+    defer db.close();
+    try initSchema(&db);
 
-fn respond(stream: std.net.Stream, status: u16, body: []const u8) !void {
-    const status_text = switch (status) {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        501 => "Not Implemented",
-        500 => "Internal Server Error",
-        else => "Unknown",
-    };
-
-    var header_buf: [512]u8 = undefined;
-    const header = try std.fmt.bufPrint(
-        &header_buf,
-        "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-        .{ status, status_text, body.len },
+    try db.exec(
+        \\INSERT INTO daily_k (symbol, date, open, close, high, low, volume, amount, change_pct) VALUES
+        \\('000001', '2026-04-27', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000001', '2026-05-01', 12, 12, 12, 12, 100, 1000, 20),
+        \\('000002', '2026-04-27', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000002', '2026-05-01', 10.5, 10.5, 10.5, 10.5, 100, 1000, 5),
+        \\('000003', '2026-04-27', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000003', '2026-05-01', 11, 11, 11, 11, 100, 1000, 10)
+    );
+    try db.exec(
+        \\INSERT INTO scan_result (scan_date, data_date, top_n, total_stocks, source, coverage_count) VALUES
+        \\('2026-04-27', '2026-04-27', 3, 3, 'db', 3),
+        \\('2026-05-01', '2026-05-01', 3, 3, 'db', 3),
+        \\('2026-05-02', '2026-05-01', 3, 3, 'db', 3)
+    );
+    try db.exec(
+        \\INSERT INTO scan_stock (scan_date, rank, symbol, name, price, change_pct, score, industry) VALUES
+        \\('2026-04-27', 1, '000001', 'Alpha', 10, 0, 80, 'Tech'),
+        \\('2026-04-27', 2, '000002', 'Beta', 10, 0, 75, 'Tech'),
+        \\('2026-04-27', 3, '000003', 'Gamma', 10, 0, 70, 'Tech'),
+        \\('2026-05-01', 1, '000001', 'Alpha', 12, 20, 90, 'Tech'),
+        \\('2026-05-01', 2, '000003', 'Gamma', 11, 10, 88, 'Tech'),
+        \\('2026-05-01', 3, '000002', 'Beta', 10.5, 5, 70, 'Tech'),
+        \\('2026-05-02', 1, '000002', 'Beta', 10.5, 5, 95, 'Tech'),
+        \\('2026-05-02', 2, '000001', 'Alpha', 12, 20, 85, 'Tech'),
+        \\('2026-05-02', 3, '000003', 'Gamma', 11, 10, 80, 'Tech')
     );
 
-    try stream.writeAll(header);
-    try stream.writeAll(body);
+    try rebuildScanPeriodSnapshot(allocator, &db, "week", "2026-04-27", 10);
+
+    var summary = try db.queryRows(allocator,
+        \\SELECT period, CAST(period_start AS VARCHAR) AS period_start, CAST(period_end AS VARCHAR) AS period_end,
+        \\       top_n, candidate_count, scan_days, CAST(data_start AS VARCHAR) AS data_start, CAST(data_end AS VARCHAR) AS data_end
+        \\FROM scan_period_result
+        \\WHERE period = 'week' AND period_start = DATE '2026-04-27'
+    );
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), summary.rows.items.len);
+    try std.testing.expectEqualStrings("2026-04-27", summary.getStr(0, "period_start").?);
+    try std.testing.expectEqualStrings("2026-05-03", summary.getStr(0, "period_end").?);
+    try std.testing.expectEqual(@as(f64, 3), summary.getF64(0, "candidate_count").?);
+    try std.testing.expectEqual(@as(f64, 2), summary.getF64(0, "scan_days").?);
+    try std.testing.expectEqualStrings("2026-04-27", summary.getStr(0, "data_start").?);
+    try std.testing.expectEqualStrings("2026-05-01", summary.getStr(0, "data_end").?);
+
+    var stocks = try db.queryRows(allocator,
+        \\SELECT rank, symbol, appearances, ROUND(avg_rank, 2) AS avg_rank,
+        \\       ROUND(avg_daily_score, 2) AS avg_daily_score, ROUND(score_delta, 2) AS score_delta,
+        \\       ROUND(return_pct, 2) AS return_pct, ROUND(period_score, 2) AS period_score
+        \\FROM scan_period_stock
+        \\WHERE period = 'week' AND period_start = DATE '2026-04-27'
+        \\ORDER BY rank
+    );
+    defer stocks.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), stocks.rows.items.len);
+    try std.testing.expectEqualStrings("000001", stocks.getStr(0, "symbol").?);
+    try std.testing.expectEqual(@as(f64, 2), stocks.getF64(0, "appearances").?);
+    try std.testing.expectEqual(@as(f64, 1), stocks.getF64(0, "avg_rank").?);
+    try std.testing.expectEqual(@as(f64, 85), stocks.getF64(0, "avg_daily_score").?);
+    try std.testing.expectEqual(@as(f64, 10), stocks.getF64(0, "score_delta").?);
+    try std.testing.expectEqual(@as(f64, 20), stocks.getF64(0, "return_pct").?);
+    try std.testing.expect(stocks.getF64(0, "period_score").? > stocks.getF64(1, "period_score").?);
+}
+
+test "scan history detail query bounds rows by recorded daily total" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/akshare_scan_history_detail_test.db";
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
+
+    var db = try duckdb.Db.open(allocator, db_path);
+    defer db.close();
+    try initSchema(&db);
+
+    try db.exec(
+        \\INSERT INTO scan_result (scan_date, data_date, top_n, total_stocks, source, coverage_count) VALUES
+        \\('2026-05-02', '2026-05-01', 3, 3, 'db', 10)
+    );
+    try db.exec(
+        \\INSERT INTO scan_stock (scan_date, rank, symbol, name, price, change_pct, score, industry) VALUES
+        \\('2026-05-02', 1, '000001', 'Alpha', 10, 1, 90, 'Tech'),
+        \\('2026-05-02', 2, '000002', 'Beta', 11, 2, 80, 'Tech'),
+        \\('2026-05-02', 3, '000003', 'Gamma', 12, 3, 70, 'Tech'),
+        \\('2026-05-02', 4, '000004', 'Delta', 13, 4, 60, 'Tech')
+    );
+
+    const query = try buildScanHistoryDetailQuery(allocator, "2026-05-02");
+    defer allocator.free(query);
+
+    var rows = try db.queryRows(allocator, query);
+    defer rows.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.items.len);
+    try std.testing.expectEqualStrings("000001", rows.getStr(0, "symbol").?);
+    try std.testing.expectEqualStrings("000003", rows.getStr(2, "symbol").?);
 }
