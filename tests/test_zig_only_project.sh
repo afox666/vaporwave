@@ -41,11 +41,26 @@ fi
 script="$(< tauri-client.sh)"
 
 [[ "$script" == *"scan)"* ]] || fail "tauri-client.sh lacks scan command"
+[[ "$script" == *"scan-period)"* ]] || fail "tauri-client.sh lacks scan-period command"
 [[ "$script" == *"stock)"* ]] || fail "tauri-client.sh lacks stock command"
 [[ "$script" == *"backtest)"* ]] || fail "tauri-client.sh lacks backtest command"
 [[ "$script" == *"/api/scan?top_n="* ]] || fail "scan CLI does not call Zig scan API"
+[[ "$script" == *"/api/scan/periods?period="* ]] || fail "scan-period list CLI does not call period list API"
+[[ "$script" == *"/api/scan/periods/\${period}/\${period_start}"* ]] || fail "scan-period detail CLI does not call period detail API"
+[[ "$script" == *"/api/scan/periods/rebuild?period="* ]] || fail "scan-period rebuild CLI does not call period rebuild API"
 [[ "$script" == *"/api/stock/\${symbol}/full"* ]] || fail "stock CLI does not call Zig stock API"
 [[ "$script" == *"/api/backtest"* ]] || fail "backtest CLI does not call Zig backtest API"
+
+[[ -f frontend/src/views/ScanPeriods.vue ]] || fail "missing scan periods frontend page"
+router_source="$(< frontend/src/router/index.ts)"
+app_source="$(< frontend/src/App.vue)"
+scan_periods_source="$(< frontend/src/views/ScanPeriods.vue)"
+[[ "$router_source" == *"ScanPeriods"* ]] || fail "router does not import scan periods page"
+[[ "$router_source" == *"/scan/periods"* ]] || fail "router lacks /scan/periods route"
+[[ "$app_source" == *"/scan/periods"* ]] || fail "navigation lacks scan periods link"
+[[ "$scan_periods_source" == *"scoreBreakdown"* ]] || fail "scan periods page lacks score breakdown helper"
+[[ "$scan_periods_source" == *"score-toggle"* ]] || fail "scan periods page lacks score breakdown toggle"
+[[ "$scan_periods_source" == *"评分拆解"* ]] || fail "scan periods page lacks visible score breakdown panel"
 
 for module in \
   zig/src/backtest_config.zig \

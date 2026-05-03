@@ -8,6 +8,7 @@
     <div class="logo">VAPORWAVE QUANT</div>
     <router-link to="/">仪表盘</router-link>
     <router-link to="/scan/history">扫描历史</router-link>
+    <router-link to="/scan/periods">周期榜单</router-link>
     <router-link to="/backtest">因子回测</router-link>
     <router-link to="/history">历史记录</router-link>
     <router-link to="/history/000001">历史数据</router-link>

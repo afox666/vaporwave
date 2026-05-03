@@ -378,9 +378,15 @@ fn initSchema(db: *duckdb.Db) !void {
         \\    scan_date DATE PRIMARY KEY,
         \\    top_n INTEGER,
         \\    total_stocks INTEGER,
+        \\    data_date DATE,
+        \\    source VARCHAR,
+        \\    coverage_count INTEGER,
         \\    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         \\)
     );
+    try db.exec("ALTER TABLE scan_result ADD COLUMN IF NOT EXISTS data_date DATE");
+    try db.exec("ALTER TABLE scan_result ADD COLUMN IF NOT EXISTS source VARCHAR");
+    try db.exec("ALTER TABLE scan_result ADD COLUMN IF NOT EXISTS coverage_count INTEGER");
     try db.exec(
         \\CREATE TABLE IF NOT EXISTS scan_stock (
         \\    scan_date DATE,
@@ -395,6 +401,45 @@ fn initSchema(db: *duckdb.Db) !void {
         \\)
     );
     try db.exec("CREATE INDEX IF NOT EXISTS idx_scan_stock_date ON scan_stock (scan_date)");
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS scan_period_result (
+        \\    period VARCHAR,
+        \\    period_start DATE,
+        \\    period_end DATE,
+        \\    top_n INTEGER,
+        \\    candidate_count INTEGER,
+        \\    scan_days INTEGER,
+        \\    data_start DATE,
+        \\    data_end DATE,
+        \\    is_current BOOLEAN,
+        \\    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY (period, period_start)
+        \\)
+    );
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS scan_period_stock (
+        \\    period VARCHAR,
+        \\    period_start DATE,
+        \\    rank INTEGER,
+        \\    symbol VARCHAR,
+        \\    name VARCHAR,
+        \\    industry VARCHAR,
+        \\    period_score DOUBLE,
+        \\    appearances INTEGER,
+        \\    best_rank INTEGER,
+        \\    avg_rank DOUBLE,
+        \\    avg_daily_score DOUBLE,
+        \\    score_delta DOUBLE,
+        \\    return_pct DOUBLE,
+        \\    first_seen_date DATE,
+        \\    latest_seen_date DATE,
+        \\    latest_price DOUBLE,
+        \\    latest_change_pct DOUBLE,
+        \\    PRIMARY KEY (period, period_start, symbol)
+        \\)
+    );
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_scan_period_result_period ON scan_period_result (period, period_start)");
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_scan_period_stock_period ON scan_period_stock (period, period_start, rank)");
     try db.exec(
         \\CREATE TABLE IF NOT EXISTS job_config (
         \\    job_name VARCHAR PRIMARY KEY,
@@ -557,7 +602,7 @@ fn runJobCommand(
         const scan_date = try resolveScheduledScanDate(allocator, db, scheduled_for);
         defer allocator.free(scan_date);
 
-        try saveScanToDb(db, allocator, scan_date, top_n, scan.items);
+        try saveScanToDb(db, allocator, scan_date, top_n, scan.items, scan.data_date, scan.source, scan.coverage_count);
         return std.fmt.allocPrint(
             allocator,
             "job=scan-daily scan_date={s} source={s} total={d} data_date={s} coverage={d}",
@@ -574,7 +619,7 @@ fn runJobCommand(
         const scan_date = try resolveScheduledScanDate(allocator, db, scheduled_for);
         defer allocator.free(scan_date);
 
-        try saveScanToDb(db, allocator, scan_date, top_n, scan.items);
+        try saveScanToDb(db, allocator, scan_date, top_n, scan.items, scan.data_date, scan.source, scan.coverage_count);
         return std.fmt.allocPrint(
             allocator,
             "job=daily-pipeline scan_date={s} source={s} total={d} data_date={s} coverage={d} sync_limit={d}",
@@ -1423,6 +1468,11 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         return;
     }
 
+    if (is_post and std.mem.startsWith(u8, uri, "/api/scan/periods/rebuild")) {
+        try handle_scan_period_rebuild(allocator, stream, uri, active_db);
+        return;
+    }
+
     if (is_post and std.mem.eql(u8, uri, "/api/backtest")) {
         try handle_backtest(allocator, stream, request_body, active_db, db_path);
         return;
@@ -1502,6 +1552,22 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     }
 
     // GET /api/scan?top_n=N  (must check specific routes first)
+    if (std.mem.startsWith(u8, uri, "/api/scan/periods/")) {
+        const stripped = http.stripQuery(uri);
+        const rest = stripped["/api/scan/periods/".len..];
+        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
+            const period = rest[0..slash];
+            const period_start = rest[slash + 1 ..];
+            try handle_scan_period_detail(allocator, stream, period, period_start, active_db);
+            return;
+        }
+        try http.respondError(allocator, stream, 400, "invalid period detail path");
+        return;
+    }
+    if (std.mem.startsWith(u8, uri, "/api/scan/periods")) {
+        try handle_scan_periods_list(allocator, stream, uri, active_db);
+        return;
+    }
     if (std.mem.eql(u8, uri, "/api/scan/history")) {
         try handle_scan_history(allocator, stream, active_db);
         return;
@@ -3724,6 +3790,335 @@ fn runMarketScan(allocator: std.mem.Allocator, db: ?*duckdb.Db, top_n: u16) !Mar
     };
 }
 
+fn isSafeScanPeriod(value: []const u8) bool {
+    return std.mem.eql(u8, value, "week") or
+        std.mem.eql(u8, value, "month") or
+        std.mem.eql(u8, value, "quarter");
+}
+
+fn scanPeriodTrunc(value: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, value, "week")) return "week";
+    if (std.mem.eql(u8, value, "month")) return "month";
+    if (std.mem.eql(u8, value, "quarter")) return "quarter";
+    return error.InvalidScanPeriod;
+}
+
+fn scanPeriodEndExpr(allocator: std.mem.Allocator, period: []const u8, period_start: []const u8) ![]u8 {
+    if (std.mem.eql(u8, period, "week")) {
+        return std.fmt.allocPrint(allocator, "DATE '{s}' + INTERVAL 6 DAY", .{period_start});
+    }
+    if (std.mem.eql(u8, period, "month")) {
+        return std.fmt.allocPrint(allocator, "DATE '{s}' + INTERVAL 1 MONTH - INTERVAL 1 DAY", .{period_start});
+    }
+    if (std.mem.eql(u8, period, "quarter")) {
+        return std.fmt.allocPrint(allocator, "DATE '{s}' + INTERVAL 3 MONTH - INTERVAL 1 DAY", .{period_start});
+    }
+    return error.InvalidScanPeriod;
+}
+
+fn resolveScanDataDate(allocator: std.mem.Allocator, d: *duckdb.Db, scan_date: []const u8, preferred_data_date: ?[]const u8) ![]const u8 {
+    if (preferred_data_date) |value| {
+        if (isSafeDate(value)) return allocator.dupe(u8, value);
+    }
+    if (!isSafeDate(scan_date)) return error.InvalidDate;
+
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT CAST(COALESCE(MAX(date), DATE '{s}') AS VARCHAR) AS data_date FROM daily_k WHERE date <= DATE '{s}'",
+        .{ scan_date, scan_date },
+    );
+    defer allocator.free(query);
+    return querySingleString(allocator, d, query, scan_date);
+}
+
+fn resolvePeriodStartForDate(allocator: std.mem.Allocator, d: *duckdb.Db, period: []const u8, data_date: []const u8) ![]const u8 {
+    if (!isSafeDate(data_date)) return error.InvalidDate;
+    const trunc = try scanPeriodTrunc(period);
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT CAST(date_trunc('{s}', DATE '{s}') AS DATE)::VARCHAR AS period_start",
+        .{ trunc, data_date },
+    );
+    defer allocator.free(query);
+    return querySingleString(allocator, d, query, data_date);
+}
+
+fn rebuildScanPeriodSnapshot(
+    allocator: std.mem.Allocator,
+    d: *duckdb.Db,
+    period: []const u8,
+    period_start: []const u8,
+    top_n: u16,
+) !void {
+    if (!isSafeScanPeriod(period)) return error.InvalidScanPeriod;
+    if (!isSafeDate(period_start)) return error.InvalidDate;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const trunc = try scanPeriodTrunc(period);
+    const period_end_expr = try scanPeriodEndExpr(aa, period, period_start);
+
+    const del_stocks = try std.fmt.allocPrint(
+        aa,
+        "DELETE FROM scan_period_stock WHERE period = '{s}' AND period_start = DATE '{s}'",
+        .{ period, period_start },
+    );
+    try d.exec(del_stocks);
+    const del_result = try std.fmt.allocPrint(
+        aa,
+        "DELETE FROM scan_period_result WHERE period = '{s}' AND period_start = DATE '{s}'",
+        .{ period, period_start },
+    );
+    try d.exec(del_result);
+
+    const insert_result = try std.fmt.allocPrint(
+        aa,
+        \\INSERT OR REPLACE INTO scan_period_result (
+        \\    period, period_start, period_end, top_n, candidate_count, scan_days,
+        \\    data_start, data_end, is_current, updated_at
+        \\)
+        \\WITH period_bounds AS (
+        \\    SELECT DATE '{s}' AS period_start, CAST(({s}) AS DATE) AS period_end
+        \\),
+        \\scan_base AS (
+        \\    SELECT
+        \\        sr.scan_date,
+        \\        COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date) AS data_date,
+        \\        GREATEST(COALESCE(sr.top_n, 100), 1) AS daily_top_n,
+        \\        ss.symbol
+        \\    FROM scan_result sr
+        \\    JOIN scan_stock ss ON ss.scan_date = sr.scan_date
+        \\    JOIN period_bounds pb ON TRUE
+        \\    WHERE COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date)
+        \\          BETWEEN pb.period_start AND pb.period_end
+        \\),
+        \\chosen_scan_dates AS (
+        \\    SELECT data_date, scan_date
+        \\    FROM (
+        \\        SELECT
+        \\            data_date,
+        \\            scan_date,
+        \\            ROW_NUMBER() OVER (
+        \\                PARTITION BY data_date
+        \\                ORDER BY CASE WHEN scan_date = data_date THEN 0 ELSE 1 END, scan_date DESC
+        \\            ) AS scan_choice
+        \\        FROM scan_base
+        \\        GROUP BY data_date, scan_date
+        \\    )
+        \\    WHERE scan_choice = 1
+        \\),
+        \\period_base AS (
+        \\    SELECT b.*
+        \\    FROM scan_base b
+        \\    JOIN chosen_scan_dates c ON c.data_date = b.data_date AND c.scan_date = b.scan_date
+        \\),
+        \\period_days AS (
+        \\    SELECT COUNT(DISTINCT data_date) AS scan_days, MIN(data_date) AS data_start, MAX(data_date) AS data_end
+        \\    FROM period_base
+        \\),
+        \\candidate_stats AS (
+        \\    SELECT COUNT(DISTINCT symbol) AS candidate_count
+        \\    FROM period_base
+        \\)
+        \\SELECT
+        \\    '{s}' AS period,
+        \\    pb.period_start,
+        \\    pb.period_end,
+        \\    {d} AS top_n,
+        \\    cs.candidate_count,
+        \\    pd.scan_days,
+        \\    pd.data_start,
+        \\    pd.data_end,
+        \\    pb.period_start = CAST(date_trunc('{s}', CURRENT_DATE) AS DATE) AS is_current,
+        \\    CURRENT_TIMESTAMP AS updated_at
+        \\FROM period_bounds pb, period_days pd, candidate_stats cs
+        \\WHERE pd.scan_days > 0
+    , .{ period_start, period_end_expr, period, top_n, trunc });
+    try d.exec(insert_result);
+
+    const insert_stocks = try std.fmt.allocPrint(
+        aa,
+        \\INSERT OR REPLACE INTO scan_period_stock (
+        \\    period, period_start, rank, symbol, name, industry, period_score,
+        \\    appearances, best_rank, avg_rank, avg_daily_score, score_delta, return_pct,
+        \\    first_seen_date, latest_seen_date, latest_price, latest_change_pct
+        \\)
+        \\WITH period_bounds AS (
+        \\    SELECT DATE '{s}' AS period_start, CAST(({s}) AS DATE) AS period_end
+        \\),
+        \\scan_base AS (
+        \\    SELECT
+        \\        sr.scan_date,
+        \\        COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date) AS data_date,
+        \\        CAST(GREATEST(COALESCE(sr.top_n, 100), 1) AS DOUBLE) AS daily_top_n,
+        \\        ss.rank,
+        \\        ss.symbol,
+        \\        ss.name,
+        \\        ss.price,
+        \\        ss.change_pct,
+        \\        ss.score,
+        \\        COALESCE(ss.industry, '') AS industry
+        \\    FROM scan_result sr
+        \\    JOIN scan_stock ss ON ss.scan_date = sr.scan_date
+        \\    JOIN period_bounds pb ON TRUE
+        \\    WHERE COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date)
+        \\          BETWEEN pb.period_start AND pb.period_end
+        \\),
+        \\chosen_scan_dates AS (
+        \\    SELECT data_date, scan_date
+        \\    FROM (
+        \\        SELECT
+        \\            data_date,
+        \\            scan_date,
+        \\            ROW_NUMBER() OVER (
+        \\                PARTITION BY data_date
+        \\                ORDER BY CASE WHEN scan_date = data_date THEN 0 ELSE 1 END, scan_date DESC
+        \\            ) AS scan_choice
+        \\        FROM scan_base
+        \\        GROUP BY data_date, scan_date
+        \\    )
+        \\    WHERE scan_choice = 1
+        \\),
+        \\period_base AS (
+        \\    SELECT b.*
+        \\    FROM scan_base b
+        \\    JOIN chosen_scan_dates c ON c.data_date = b.data_date AND c.scan_date = b.scan_date
+        \\),
+        \\period_days AS (
+        \\    SELECT COUNT(DISTINCT data_date) AS scan_days
+        \\    FROM period_base
+        \\),
+        \\agg AS (
+        \\    SELECT
+        \\        symbol,
+        \\        arg_max(name, data_date) AS name,
+        \\        arg_max(industry, data_date) AS industry,
+        \\        COUNT(DISTINCT data_date) AS appearances,
+        \\        MIN(rank) AS best_rank,
+        \\        AVG(CAST(rank AS DOUBLE)) AS avg_rank,
+        \\        AVG((daily_top_n + 1.0 - CAST(rank AS DOUBLE)) * 100.0 / daily_top_n) AS rank_score,
+        \\        AVG(score) AS avg_daily_score,
+        \\        arg_min(score, data_date) AS first_score,
+        \\        arg_max(score, data_date) AS latest_score,
+        \\        MIN(data_date) AS first_seen_date,
+        \\        MAX(data_date) AS latest_seen_date,
+        \\        arg_min(price, data_date) AS first_scan_price,
+        \\        arg_max(price, data_date) AS latest_scan_price,
+        \\        arg_max(change_pct, data_date) AS latest_change_pct
+        \\    FROM period_base
+        \\    GROUP BY symbol
+        \\),
+        \\priced AS (
+        \\    SELECT
+        \\        a.*,
+        \\        COALESCE(first_k.close, a.first_scan_price) AS first_price,
+        \\        COALESCE(latest_k.close, a.latest_scan_price) AS latest_price
+        \\    FROM agg a
+        \\    LEFT JOIN daily_k first_k ON first_k.symbol = a.symbol AND first_k.date = a.first_seen_date
+        \\    LEFT JOIN daily_k latest_k ON latest_k.symbol = a.symbol AND latest_k.date = a.latest_seen_date
+        \\),
+        \\scored AS (
+        \\    SELECT
+        \\        p.*,
+        \\        CASE
+        \\            WHEN p.first_price IS NULL OR p.first_price = 0 OR p.latest_price IS NULL THEN 0
+        \\            ELSE (p.latest_price - p.first_price) / p.first_price * 100.0
+        \\        END AS return_pct,
+        \\        p.latest_score - p.first_score AS score_delta,
+        \\        pd.scan_days
+        \\    FROM priced p, period_days pd
+        \\),
+        \\ranked AS (
+        \\    SELECT
+        \\        *,
+        \\        30.0 * CAST(appearances AS DOUBLE) / NULLIF(CAST(scan_days AS DOUBLE), 0.0)
+        \\        + 25.0 * rank_score / 100.0
+        \\        + 20.0 * avg_daily_score / 100.0
+        \\        + 15.0 * LEAST(100.0, GREATEST(0.0, (return_pct + 10.0) / 30.0 * 100.0)) / 100.0
+        \\        + 10.0 * LEAST(100.0, GREATEST(0.0, (score_delta + 20.0) / 40.0 * 100.0)) / 100.0 AS period_score
+        \\    FROM scored
+        \\    WHERE scan_days > 0
+        \\)
+        \\SELECT
+        \\    '{s}' AS period,
+        \\    DATE '{s}' AS period_start,
+        \\    ROW_NUMBER() OVER (
+        \\        ORDER BY period_score DESC, appearances DESC, return_pct DESC, latest_score DESC, symbol ASC
+        \\    ) AS rank,
+        \\    symbol,
+        \\    name,
+        \\    industry,
+        \\    period_score,
+        \\    appearances,
+        \\    best_rank,
+        \\    avg_rank,
+        \\    avg_daily_score,
+        \\    score_delta,
+        \\    return_pct,
+        \\    first_seen_date,
+        \\    latest_seen_date,
+        \\    latest_price,
+        \\    latest_change_pct
+        \\FROM ranked
+        \\ORDER BY period_score DESC, appearances DESC, return_pct DESC, latest_score DESC, symbol ASC
+        \\LIMIT {d}
+    , .{ period_start, period_end_expr, period, period_start, top_n });
+    try d.exec(insert_stocks);
+}
+
+fn rebuildScanPeriodSnapshotsForDataDate(allocator: std.mem.Allocator, d: *duckdb.Db, data_date: []const u8, top_n: u16) !void {
+    const periods = [_][]const u8{ "week", "month", "quarter" };
+    for (periods) |period| {
+        const period_start = try resolvePeriodStartForDate(allocator, d, period, data_date);
+        defer allocator.free(period_start);
+        try rebuildScanPeriodSnapshot(allocator, d, period, period_start, top_n);
+    }
+}
+
+fn rebuildScanPeriodSnapshots(allocator: std.mem.Allocator, d: *duckdb.Db, requested_period: []const u8, top_n: u16) !usize {
+    if (std.mem.eql(u8, requested_period, "all")) {
+        var total: usize = 0;
+        total += try rebuildScanPeriodSnapshots(allocator, d, "week", top_n);
+        total += try rebuildScanPeriodSnapshots(allocator, d, "month", top_n);
+        total += try rebuildScanPeriodSnapshots(allocator, d, "quarter", top_n);
+        return total;
+    }
+    if (!isSafeScanPeriod(requested_period)) return error.InvalidScanPeriod;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const trunc = try scanPeriodTrunc(requested_period);
+    const query = try std.fmt.allocPrint(
+        aa,
+        \\WITH scan_dates AS (
+        \\    SELECT DISTINCT
+        \\        COALESCE(data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= scan_date), scan_date) AS data_date
+        \\    FROM scan_result
+        \\)
+        \\SELECT DISTINCT CAST(date_trunc('{s}', data_date) AS DATE)::VARCHAR AS period_start
+        \\FROM scan_dates
+        \\WHERE data_date IS NOT NULL
+        \\ORDER BY period_start
+    , .{trunc});
+
+    var rows = try d.queryRows(allocator, query);
+    defer rows.deinit(allocator);
+
+    var count: usize = 0;
+    var r: usize = 0;
+    while (r < rows.rows.items.len) : (r += 1) {
+        const period_start = rows.getStr(r, "period_start") orelse continue;
+        if (!isSafeDate(period_start)) continue;
+        try rebuildScanPeriodSnapshot(allocator, d, requested_period, period_start, top_n);
+        count += 1;
+    }
+    return count;
+}
+
 fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
     var top_n: u16 = 100;
     if (std.mem.indexOf(u8, uri, "?")) |idx| {
@@ -3745,7 +4140,7 @@ fn handle_scan(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []cons
         const scan_date = currentDbDate(allocator, d) catch null;
         defer if (scan_date) |value| allocator.free(value);
         if (scan_date) |value| {
-            saveScanToDb(d, allocator, value, top_n, scan.items) catch |err| {
+            saveScanToDb(d, allocator, value, top_n, scan.items, scan.data_date, scan.source, scan.coverage_count) catch |err| {
                 std.debug.print("DuckDB save error: {any}\n", .{err});
             };
         }
@@ -3802,22 +4197,33 @@ fn saveScanToDb(
     scan_date: []const u8,
     top_n: u16,
     items: []const ScoredStock,
+    data_date: ?[]const u8,
+    source: []const u8,
+    coverage_count: usize,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
+    const effective_data_date = try resolveScanDataDate(allocator, d, scan_date, data_date);
+    defer allocator.free(effective_data_date);
+    const escaped_source = try sql_text.escape(aa, source);
+
     const insert_scan = try std.fmt.allocPrint(
         aa,
-        "INSERT OR REPLACE INTO scan_result (scan_date, top_n, total_stocks) VALUES ('{s}', {d}, {d})",
-        .{ scan_date, top_n, items.len },
+        \\INSERT OR REPLACE INTO scan_result
+        \\    (scan_date, top_n, total_stocks, data_date, source, coverage_count, created_at)
+        \\VALUES
+        \\    ('{s}', {d}, {d}, '{s}', '{s}', {d}, COALESCE((SELECT created_at FROM scan_result WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}' LIMIT 1), CURRENT_TIMESTAMP))
+    ,
+        .{ scan_date, top_n, items.len, effective_data_date, escaped_source, coverage_count, scan_date, scan_date },
     );
     try d.exec(insert_scan);
 
     const del = try std.fmt.allocPrint(
         aa,
-        "DELETE FROM scan_stock WHERE scan_date = '{s}'",
-        .{scan_date},
+        "DELETE FROM scan_stock WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}'",
+        .{ scan_date, scan_date },
     );
     try d.exec(del);
 
@@ -3834,6 +4240,8 @@ fn saveScanToDb(
         );
         try d.exec(insert_stock);
     }
+
+    try rebuildScanPeriodSnapshotsForDataDate(allocator, d, effective_data_date, top_n);
 }
 
 // ============================================================
@@ -3841,7 +4249,19 @@ fn saveScanToDb(
 // ============================================================
 fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db: ?*duckdb.Db) !void {
     if (db) |d| {
-        var result = d.queryRows(allocator, "SELECT CAST(scan_date AS VARCHAR) AS scan_date, top_n, total_stocks, CAST(created_at AS VARCHAR) as created_at FROM scan_result ORDER BY scan_date DESC LIMIT 100") catch |err| {
+        var result = d.queryRows(allocator,
+            \\SELECT
+            \\    CAST(scan_date AS VARCHAR) AS scan_date,
+            \\    CAST(COALESCE(data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= scan_result.scan_date), scan_date) AS VARCHAR) AS data_date,
+            \\    top_n,
+            \\    total_stocks,
+            \\    COALESCE(source, '') AS source,
+            \\    COALESCE(coverage_count, 0) AS coverage_count,
+            \\    CAST(created_at AS VARCHAR) as created_at
+            \\FROM scan_result
+            \\ORDER BY scan_date DESC
+            \\LIMIT 100
+        ) catch |err| {
             std.debug.print("DuckDB query error: {any}\n", .{err});
             try http.respond(stream, 200, "[]");
             return;
@@ -3858,10 +4278,16 @@ fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db:
             try s.beginObject();
             try s.objectField("scan_date");
             try s.write(result.getStr(r, "scan_date") orelse "");
+            try s.objectField("data_date");
+            try s.write(result.getStr(r, "data_date") orelse "");
             try s.objectField("top_n");
             try s.write(result.getF64(r, "top_n") orelse 0);
             try s.objectField("total_stocks");
             try s.write(result.getF64(r, "total_stocks") orelse 0);
+            try s.objectField("source");
+            try s.write(result.getStr(r, "source") orelse "");
+            try s.objectField("coverage_count");
+            try s.write(result.getF64(r, "coverage_count") orelse 0);
             try s.objectField("created_at");
             try s.write(result.getStr(r, "created_at") orelse "");
             try s.endObject();
@@ -3877,17 +4303,40 @@ fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db:
 // ============================================================
 // Scan history detail
 // ============================================================
+fn buildScanHistoryDetailQuery(allocator: std.mem.Allocator, date_str: []const u8) ![]u8 {
+    if (!isSafeDate(date_str)) return error.InvalidDate;
+    return std.fmt.allocPrint(
+        allocator,
+        \\WITH scan_bound AS (
+        \\    SELECT COALESCE(total_stocks, top_n, 2147483647) AS max_rank
+        \\    FROM scan_result
+        \\    WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}'
+        \\    ORDER BY scan_date DESC
+        \\    LIMIT 1
+        \\)
+        \\SELECT rank, symbol, name, price, change_pct, score, industry
+        \\FROM scan_stock
+        \\WHERE scan_date BETWEEN DATE '{s}' AND DATE '{s}'
+        \\  AND rank <= COALESCE((SELECT max_rank FROM scan_bound), 2147483647)
+        \\ORDER BY rank
+    ,
+        .{ date_str, date_str, date_str, date_str },
+    );
+}
+
 fn handle_scan_history_detail(allocator: std.mem.Allocator, stream: std.net.Stream, date_str: []const u8, db: ?*duckdb.Db) !void {
     if (db) |d| {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
 
-        const query = try std.fmt.allocPrint(
-            aa,
-            "SELECT rank, symbol, name, price, change_pct, score, industry FROM scan_stock WHERE scan_date = '{s}' ORDER BY rank",
-            .{date_str},
-        );
+        const query = buildScanHistoryDetailQuery(aa, date_str) catch |err| switch (err) {
+            error.InvalidDate => {
+                try http.respondError(allocator, stream, 400, "invalid scan date");
+                return;
+            },
+            else => return err,
+        };
 
         var result = d.queryRows(allocator, query) catch |err| {
             std.debug.print("DuckDB query error: {any}\n", .{err});
@@ -3933,6 +4382,255 @@ fn handle_scan_history_detail(allocator: std.mem.Allocator, stream: std.net.Stre
     }
 }
 
+fn handle_scan_periods_list(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
+    const period = http.queryParam(uri, "period") orelse "week";
+    if (!isSafeScanPeriod(period)) {
+        try http.respondError(allocator, stream, 400, "invalid period");
+        return;
+    }
+    const limit = parsePositiveQueryInt(uri, "limit", 100, 500);
+
+    if (db) |d| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const query = try std.fmt.allocPrint(
+            aa,
+            \\SELECT
+            \\    period,
+            \\    CAST(period_start AS VARCHAR) AS period_start,
+            \\    CAST(period_end AS VARCHAR) AS period_end,
+            \\    top_n,
+            \\    candidate_count,
+            \\    scan_days,
+            \\    CAST(data_start AS VARCHAR) AS data_start,
+            \\    CAST(data_end AS VARCHAR) AS data_end,
+            \\    is_current,
+            \\    CAST(updated_at AS VARCHAR) AS updated_at
+            \\FROM scan_period_result
+            \\WHERE period = '{s}'
+            \\ORDER BY period_start DESC
+            \\LIMIT {d}
+        , .{ period, limit });
+
+        var result = d.queryRows(allocator, query) catch |err| {
+            std.debug.print("DuckDB period list query error: {any}\n", .{err});
+            try http.respond(stream, 200, "[]");
+            return;
+        };
+        defer result.deinit(allocator);
+
+        var out = std.io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+
+        try s.beginArray();
+        var r: usize = 0;
+        while (r < result.rows.items.len) : (r += 1) {
+            try s.beginObject();
+            try s.objectField("period");
+            try s.write(result.getStr(r, "period") orelse period);
+            try s.objectField("period_start");
+            try s.write(result.getStr(r, "period_start") orelse "");
+            try s.objectField("period_end");
+            try s.write(result.getStr(r, "period_end") orelse "");
+            try s.objectField("top_n");
+            try s.write(result.getF64(r, "top_n") orelse 0);
+            try s.objectField("candidate_count");
+            try s.write(result.getF64(r, "candidate_count") orelse 0);
+            try s.objectField("scan_days");
+            try s.write(result.getF64(r, "scan_days") orelse 0);
+            try s.objectField("data_start");
+            try s.write(result.getStr(r, "data_start") orelse "");
+            try s.objectField("data_end");
+            try s.write(result.getStr(r, "data_end") orelse "");
+            try s.objectField("is_current");
+            try s.write(parseBoolish(result.getStr(r, "is_current") orelse "false"));
+            try s.objectField("updated_at");
+            try s.write(result.getStr(r, "updated_at") orelse "");
+            try s.endObject();
+        }
+        try s.endArray();
+        try http.respond(stream, 200, out.written());
+    } else {
+        try http.respond(stream, 200, "[]");
+    }
+}
+
+fn handle_scan_period_detail(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    period: []const u8,
+    period_start: []const u8,
+    db: ?*duckdb.Db,
+) !void {
+    if (!isSafeScanPeriod(period) or !isSafeDate(period_start)) {
+        try http.respondError(allocator, stream, 400, "invalid period");
+        return;
+    }
+
+    if (db) |d| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const summary_query = try std.fmt.allocPrint(
+            aa,
+            \\SELECT
+            \\    period,
+            \\    CAST(period_start AS VARCHAR) AS period_start,
+            \\    CAST(period_end AS VARCHAR) AS period_end,
+            \\    top_n,
+            \\    candidate_count,
+            \\    scan_days,
+            \\    CAST(data_start AS VARCHAR) AS data_start,
+            \\    CAST(data_end AS VARCHAR) AS data_end,
+            \\    is_current,
+            \\    CAST(updated_at AS VARCHAR) AS updated_at
+            \\FROM scan_period_result
+            \\WHERE period = '{s}' AND period_start = DATE '{s}'
+        , .{ period, period_start });
+        var summary = d.queryRows(allocator, summary_query) catch |err| {
+            std.debug.print("DuckDB period detail summary error: {any}\n", .{err});
+            try http.respond(stream, 200, "{\"stocks\":[]}");
+            return;
+        };
+        defer summary.deinit(allocator);
+
+        const stocks_query = try std.fmt.allocPrint(
+            aa,
+            \\SELECT
+            \\    rank,
+            \\    symbol,
+            \\    name,
+            \\    industry,
+            \\    period_score,
+            \\    appearances,
+            \\    best_rank,
+            \\    avg_rank,
+            \\    avg_daily_score,
+            \\    score_delta,
+            \\    return_pct,
+            \\    CAST(first_seen_date AS VARCHAR) AS first_seen_date,
+            \\    CAST(latest_seen_date AS VARCHAR) AS latest_seen_date,
+            \\    latest_price,
+            \\    latest_change_pct
+            \\FROM scan_period_stock
+            \\WHERE period = '{s}' AND period_start = DATE '{s}'
+            \\ORDER BY rank
+        , .{ period, period_start });
+        var stocks = d.queryRows(allocator, stocks_query) catch |err| {
+            std.debug.print("DuckDB period detail stock error: {any}\n", .{err});
+            try http.respond(stream, 200, "{\"stocks\":[]}");
+            return;
+        };
+        defer stocks.deinit(allocator);
+
+        var out = std.io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+
+        const has_summary = summary.rows.items.len > 0;
+        try s.beginObject();
+        try s.objectField("period");
+        try s.write(if (has_summary) summary.getStr(0, "period") orelse period else period);
+        try s.objectField("period_start");
+        try s.write(if (has_summary) summary.getStr(0, "period_start") orelse period_start else period_start);
+        try s.objectField("period_end");
+        try s.write(if (has_summary) summary.getStr(0, "period_end") orelse "" else "");
+        try s.objectField("top_n");
+        try s.write(if (has_summary) summary.getF64(0, "top_n") orelse 0 else 0);
+        try s.objectField("candidate_count");
+        try s.write(if (has_summary) summary.getF64(0, "candidate_count") orelse 0 else 0);
+        try s.objectField("scan_days");
+        try s.write(if (has_summary) summary.getF64(0, "scan_days") orelse 0 else 0);
+        try s.objectField("data_start");
+        try s.write(if (has_summary) summary.getStr(0, "data_start") orelse "" else "");
+        try s.objectField("data_end");
+        try s.write(if (has_summary) summary.getStr(0, "data_end") orelse "" else "");
+        try s.objectField("is_current");
+        try s.write(if (has_summary) parseBoolish(summary.getStr(0, "is_current") orelse "false") else false);
+        try s.objectField("updated_at");
+        try s.write(if (has_summary) summary.getStr(0, "updated_at") orelse "" else "");
+        try s.objectField("stocks");
+        try s.beginArray();
+        var r: usize = 0;
+        while (r < stocks.rows.items.len) : (r += 1) {
+            try s.beginObject();
+            try s.objectField("rank");
+            try s.write(stocks.getF64(r, "rank") orelse 0);
+            try s.objectField("symbol");
+            try s.write(stocks.getStr(r, "symbol") orelse "");
+            try s.objectField("name");
+            try s.write(stocks.getStr(r, "name") orelse "");
+            try s.objectField("industry");
+            try s.write(stocks.getStr(r, "industry") orelse "");
+            try s.objectField("period_score");
+            try s.write(stocks.getF64(r, "period_score") orelse 0);
+            try s.objectField("appearances");
+            try s.write(stocks.getF64(r, "appearances") orelse 0);
+            try s.objectField("best_rank");
+            try s.write(stocks.getF64(r, "best_rank") orelse 0);
+            try s.objectField("avg_rank");
+            try s.write(stocks.getF64(r, "avg_rank") orelse 0);
+            try s.objectField("avg_daily_score");
+            try s.write(stocks.getF64(r, "avg_daily_score") orelse 0);
+            try s.objectField("score_delta");
+            try s.write(stocks.getF64(r, "score_delta") orelse 0);
+            try s.objectField("return_pct");
+            try s.write(stocks.getF64(r, "return_pct") orelse 0);
+            try s.objectField("first_seen_date");
+            try s.write(stocks.getStr(r, "first_seen_date") orelse "");
+            try s.objectField("latest_seen_date");
+            try s.write(stocks.getStr(r, "latest_seen_date") orelse "");
+            try s.objectField("latest_price");
+            try s.write(stocks.getF64(r, "latest_price") orelse 0);
+            try s.objectField("latest_change_pct");
+            try s.write(stocks.getF64(r, "latest_change_pct") orelse 0);
+            try s.endObject();
+        }
+        try s.endArray();
+        try s.endObject();
+        try http.respond(stream, 200, out.written());
+    } else {
+        try http.respond(stream, 200, "{\"stocks\":[]}");
+    }
+}
+
+fn handle_scan_period_rebuild(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
+    const period = http.queryParam(uri, "period") orelse "all";
+    if (!std.mem.eql(u8, period, "all") and !isSafeScanPeriod(period)) {
+        try http.respondError(allocator, stream, 400, "invalid period");
+        return;
+    }
+    const top_n_usize = parsePositiveQueryInt(uri, "top_n", 100, 500);
+    const top_n: u16 = @intCast(top_n_usize);
+
+    if (db) |d| {
+        const rebuilt = rebuildScanPeriodSnapshots(allocator, d, period, top_n) catch |err| {
+            std.debug.print("DuckDB period rebuild error: {any}\n", .{err});
+            try http.respondError(allocator, stream, 500, "period rebuild failed");
+            return;
+        };
+
+        var out = std.io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+        try s.beginObject();
+        try s.objectField("period");
+        try s.write(period);
+        try s.objectField("top_n");
+        try s.write(top_n);
+        try s.objectField("rebuilt");
+        try s.write(rebuilt);
+        try s.endObject();
+        try http.respond(stream, 200, out.written());
+    } else {
+        try http.respondError(allocator, stream, 500, "database unavailable");
+    }
+}
+
 fn handle_factors(stream: std.net.Stream) !void {
     const body =
         \\[
@@ -3948,4 +4646,111 @@ fn handle_factors(stream: std.net.Stream) !void {
         \\]
     ;
     try http.respond(stream, 200, body);
+}
+
+test "weekly scan period rebuild deduplicates repeated trading dates" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/akshare_period_scan_test.db";
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
+
+    var db = try duckdb.Db.open(allocator, db_path);
+    defer db.close();
+    try initSchema(&db);
+
+    try db.exec(
+        \\INSERT INTO daily_k (symbol, date, open, close, high, low, volume, amount, change_pct) VALUES
+        \\('000001', '2026-04-27', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000001', '2026-05-01', 12, 12, 12, 12, 100, 1000, 20),
+        \\('000002', '2026-04-27', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000002', '2026-05-01', 10.5, 10.5, 10.5, 10.5, 100, 1000, 5),
+        \\('000003', '2026-04-27', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000003', '2026-05-01', 11, 11, 11, 11, 100, 1000, 10)
+    );
+    try db.exec(
+        \\INSERT INTO scan_result (scan_date, data_date, top_n, total_stocks, source, coverage_count) VALUES
+        \\('2026-04-27', '2026-04-27', 3, 3, 'db', 3),
+        \\('2026-05-01', '2026-05-01', 3, 3, 'db', 3),
+        \\('2026-05-02', '2026-05-01', 3, 3, 'db', 3)
+    );
+    try db.exec(
+        \\INSERT INTO scan_stock (scan_date, rank, symbol, name, price, change_pct, score, industry) VALUES
+        \\('2026-04-27', 1, '000001', 'Alpha', 10, 0, 80, 'Tech'),
+        \\('2026-04-27', 2, '000002', 'Beta', 10, 0, 75, 'Tech'),
+        \\('2026-04-27', 3, '000003', 'Gamma', 10, 0, 70, 'Tech'),
+        \\('2026-05-01', 1, '000001', 'Alpha', 12, 20, 90, 'Tech'),
+        \\('2026-05-01', 2, '000003', 'Gamma', 11, 10, 88, 'Tech'),
+        \\('2026-05-01', 3, '000002', 'Beta', 10.5, 5, 70, 'Tech'),
+        \\('2026-05-02', 1, '000002', 'Beta', 10.5, 5, 95, 'Tech'),
+        \\('2026-05-02', 2, '000001', 'Alpha', 12, 20, 85, 'Tech'),
+        \\('2026-05-02', 3, '000003', 'Gamma', 11, 10, 80, 'Tech')
+    );
+
+    try rebuildScanPeriodSnapshot(allocator, &db, "week", "2026-04-27", 10);
+
+    var summary = try db.queryRows(allocator,
+        \\SELECT period, CAST(period_start AS VARCHAR) AS period_start, CAST(period_end AS VARCHAR) AS period_end,
+        \\       top_n, candidate_count, scan_days, CAST(data_start AS VARCHAR) AS data_start, CAST(data_end AS VARCHAR) AS data_end
+        \\FROM scan_period_result
+        \\WHERE period = 'week' AND period_start = DATE '2026-04-27'
+    );
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), summary.rows.items.len);
+    try std.testing.expectEqualStrings("2026-04-27", summary.getStr(0, "period_start").?);
+    try std.testing.expectEqualStrings("2026-05-03", summary.getStr(0, "period_end").?);
+    try std.testing.expectEqual(@as(f64, 3), summary.getF64(0, "candidate_count").?);
+    try std.testing.expectEqual(@as(f64, 2), summary.getF64(0, "scan_days").?);
+    try std.testing.expectEqualStrings("2026-04-27", summary.getStr(0, "data_start").?);
+    try std.testing.expectEqualStrings("2026-05-01", summary.getStr(0, "data_end").?);
+
+    var stocks = try db.queryRows(allocator,
+        \\SELECT rank, symbol, appearances, ROUND(avg_rank, 2) AS avg_rank,
+        \\       ROUND(avg_daily_score, 2) AS avg_daily_score, ROUND(score_delta, 2) AS score_delta,
+        \\       ROUND(return_pct, 2) AS return_pct, ROUND(period_score, 2) AS period_score
+        \\FROM scan_period_stock
+        \\WHERE period = 'week' AND period_start = DATE '2026-04-27'
+        \\ORDER BY rank
+    );
+    defer stocks.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), stocks.rows.items.len);
+    try std.testing.expectEqualStrings("000001", stocks.getStr(0, "symbol").?);
+    try std.testing.expectEqual(@as(f64, 2), stocks.getF64(0, "appearances").?);
+    try std.testing.expectEqual(@as(f64, 1), stocks.getF64(0, "avg_rank").?);
+    try std.testing.expectEqual(@as(f64, 85), stocks.getF64(0, "avg_daily_score").?);
+    try std.testing.expectEqual(@as(f64, 10), stocks.getF64(0, "score_delta").?);
+    try std.testing.expectEqual(@as(f64, 20), stocks.getF64(0, "return_pct").?);
+    try std.testing.expect(stocks.getF64(0, "period_score").? > stocks.getF64(1, "period_score").?);
+}
+
+test "scan history detail query bounds rows by recorded daily total" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/akshare_scan_history_detail_test.db";
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
+
+    var db = try duckdb.Db.open(allocator, db_path);
+    defer db.close();
+    try initSchema(&db);
+
+    try db.exec(
+        \\INSERT INTO scan_result (scan_date, data_date, top_n, total_stocks, source, coverage_count) VALUES
+        \\('2026-05-02', '2026-05-01', 3, 3, 'db', 10)
+    );
+    try db.exec(
+        \\INSERT INTO scan_stock (scan_date, rank, symbol, name, price, change_pct, score, industry) VALUES
+        \\('2026-05-02', 1, '000001', 'Alpha', 10, 1, 90, 'Tech'),
+        \\('2026-05-02', 2, '000002', 'Beta', 11, 2, 80, 'Tech'),
+        \\('2026-05-02', 3, '000003', 'Gamma', 12, 3, 70, 'Tech'),
+        \\('2026-05-02', 4, '000004', 'Delta', 13, 4, 60, 'Tech')
+    );
+
+    const query = try buildScanHistoryDetailQuery(allocator, "2026-05-02");
+    defer allocator.free(query);
+
+    var rows = try db.queryRows(allocator, query);
+    defer rows.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.items.len);
+    try std.testing.expectEqualStrings("000001", rows.getStr(0, "symbol").?);
+    try std.testing.expectEqualStrings("000003", rows.getStr(2, "symbol").?);
 }
