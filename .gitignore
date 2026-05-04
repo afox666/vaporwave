@@ -16,6 +16,7 @@ frontend/tsconfig.tsbuildinfo
 .vite/
 
 # Cache
+.superpowers/
 .backtest_cache/
 .backtest_history/
 .backtest_result_cache/
