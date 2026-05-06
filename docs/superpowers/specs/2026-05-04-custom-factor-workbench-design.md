@@ -61,7 +61,7 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 - Tab 顺序清晰，允许键盘操作。
 - 调整窗口、方向、权重后，右侧解释面板同步说明影响。
 - 校验错误必须可操作，例如 `120日窗口历史不足，建议改为60日`。
-- 前端用 localStorage 保存未提交草稿，刷新后不丢失工作台状态。
+- 前端用 localStorage 保存未提交草稿，刷新后不丢失工作台状态。草稿 key 固定为 `vaporwave:backtest:customFactorDraft:v1`，值包含 `schema_version`、`saved_at`、`custom_factors` 和工作台 UI 状态；版本不匹配时丢弃草稿并提示用户重新选择模板，不尝试静默迁移。
 
 ## API 设计
 
@@ -81,12 +81,12 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 
 ```json
 {
-  "factors": ["custom:4f9a2c10"],
+  "factors": ["custom:4f9a2c10d7b831aa"],
   "custom_factors": [
     {
       "schema_version": 1,
       "engine_version": "custom-factor-v1",
-      "id": "custom:4f9a2c10",
+      "id": "custom:4f9a2c10d7b831aa",
       "name": "稳健动量",
       "description": "60日趋势动量 + 20日波动率惩罚",
       "combine": "weighted_sum",
@@ -135,11 +135,62 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 - `engine_version`
 - `estimated_valid_observation_rate`
 - `component_missing_counts`
+- `sample_scope`
 - `warnings`
 - `errors`
 - `suggestions`
 
-该接口需要前端 debounce，避免频繁触发昂贵检查。
+请求体包含两个层级：
+
+```json
+{
+  "mode": "schema",
+  "factors": ["custom:4f9a2c10d7b831aa"],
+  "custom_factors": [
+    {
+      "schema_version": 1,
+      "engine_version": "custom-factor-v1",
+      "name": "稳健动量",
+      "combine": "weighted_sum",
+      "normalize": "cross_section_rank",
+      "components": [
+        {
+          "kind": "momentum",
+          "field": "close",
+          "window": 60,
+          "direction": "higher",
+          "weight": 0.55
+        },
+        {
+          "kind": "volatility",
+          "field": "close",
+          "window": 20,
+          "direction": "lower",
+          "weight": 0.45
+        }
+      ]
+    }
+  ],
+  "context": {
+    "start_date": "2024-01-01",
+    "end_date": "2026-05-01",
+    "rebalance_period": 20,
+    "pool_size": 100,
+    "pool_mode": "dynamic",
+    "industry": null,
+    "min_amount": 10000000,
+    "min_listed_days": 60,
+    "limit_pct": 9.8
+  }
+}
+```
+
+`mode` 控制成本边界：
+
+- `schema`：默认模式，不访问 DuckDB，只做 JSON 结构、白名单、窗口、权重、稳定 hash、lookback 和可读摘要校验。前端可在用户修改控件后 debounce 调用，目标是轻量、快速、无行情依赖。
+- `sample`：样本预估模式，需要 `context`，使用与回测一致的日期、股票池、行业、成交额、新股和涨跌停参数估算组件缺失与有效样本率。该模式不构建组合、不计算收益、不写缓存。
+
+`sample` 模式必须有明确上限：默认最多检查 200 只股票、12 个调仓日；如果实际范围更大，返回 `sample_scope` 说明抽样数量、调仓日数量和 `estimated: true`。最终回测仍按完整股票池和完整调仓日期重新计算，`validate` 的样本率只作为提交前预警。前端只在用户点击 `先看因子效果`、切换模板后稳定停顿，或运行回测前调用 `sample`，避免每个控件变化都触发昂贵检查。
 
 ### 返回结构
 
@@ -148,13 +199,13 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 ```json
 {
   "config": {
-    "factors": ["custom:4f9a2c10"],
+    "factors": ["custom:4f9a2c10d7b831aa"],
     "factor_labels": {
-      "custom:4f9a2c10": "稳健动量"
+      "custom:4f9a2c10d7b831aa": "稳健动量"
     },
     "factor_definitions": [
       {
-        "key": "custom:4f9a2c10",
+        "key": "custom:4f9a2c10d7b831aa",
         "name": "稳健动量",
         "description": "60日趋势动量 + 20日波动率惩罚",
         "schema_version": 1,
@@ -180,10 +231,10 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
     ]
   },
   "ic_analysis": {
-    "custom:4f9a2c10": {}
+    "custom:4f9a2c10d7b831aa": {}
   },
   "factor_research": {
-    "custom:4f9a2c10": {}
+    "custom:4f9a2c10d7b831aa": {}
   }
 }
 ```
@@ -206,6 +257,15 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 - `zig/src/backtest_factor_cache.zig`：缓存 key 从 enum 因子名扩展为稳定 factor key。
 - `zig/src/main.zig`：新增模板接口和校验接口。
 - `frontend/src/api/index.ts`：补充自定义因子类型、模板接口、校验接口。
+
+### 兼容与迁移
+
+- 旧请求只有 `factors: string[]` 时，服务端把每个字符串解析为 `builtin FactorSpec`，继续走现有内置因子计算逻辑。
+- 新请求中 `factors` 可以混合内置因子 key 和 `custom:<hash>`。每个 `custom:<hash>` 必须能在同一请求的 `custom_factors` 中通过服务端重新计算得到；缺失定义或 hash 不一致时返回 400。
+- 旧 `.backtest_history/` 文件、旧 `.backtest_tasks/` 持久化请求和旧同步回测 JSON 继续按旧结构读取。前端展示旧结果时，`factor_labels` 缺失则直接使用 `config.factors` 里的字符串作为展示名。
+- 旧结果缓存保持只读兼容，不批量迁移。新结果缓存 key 使用新的 cache schema version，例如 `backtest-result-v2`，并纳入规范化 custom factor hash、`schema_version` 和 `engine_version`。
+- 内置因子的 `factor_daily` 缓存继续使用现有 `calc_version = zig-factor-v1`；自定义最终因子使用 `calc_version = custom-factor-v1` 和 `factor_name = custom:<hash>`。
+- 任务恢复时，如果任务处于完成态且已有 `result`，即使请求中的自定义定义无法重新校验，也优先展示已保存结果；重新运行同一请求时必须重新通过新校验。
 
 ### FactorSpec
 
@@ -238,7 +298,7 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 - `volume_ratio`：`field = volume` + `short_window` + `long_window`
 - `rsi`：`field = close` + `window`
 - `price_percentile`：`field = close` + `window`
-- `pe_percentile`：不使用 `field`，使用估值时间序列和 `window`
+- `pe_percentile`：不使用 `field`，第一版不接受 `window`，语义与现有内置 `pe_percentile` 保持一致，即使用调仓日及以前的可用 PE 估值点计算历史百分位；lookback 贡献沿用内置因子的 60 个交易日数据缓冲。
 
 窗口限制：
 
@@ -262,6 +322,20 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 - 不依赖 JSON 字段顺序
 
 这样用户改中文名不会影响缓存和历史复现。
+
+规范化过程必须可执行：
+
+1. 解析并校验结构，忽略客户端传入的 `id`，由服务端重新计算 `factor_key`；如果请求中带有 `id` 且与服务端结果不一致，`validate` 返回 warning，回测请求返回 400。
+2. 组件按规范化 tuple 排序：`kind`、`field`、`window`、`short_window`、`long_window`、`direction`。完全相同的 tuple 视为重复组件并拒绝，避免权重残差和解释文本出现歧义。第一版 `weighted_sum` 是交换律组合，组件顺序不表达语义；未来如果引入顺序敏感表达式，必须升级 `schema_version`。
+3. 权重先校验为有限正数，按权重总和归一化。归一化后转换为 `weight_ppm = round(weight / sum * 1_000_000)`；按排序后的组件顺序计算，最后一个组件吸收舍入残差，保证 ppm 总和等于 `1_000_000`。
+4. 生成无空白 canonical JSON，字段顺序固定为 `schema_version`、`engine_version`、`combine`、`normalize`、`components`。组件字段顺序固定为 `kind`、`field`、`window`、`short_window`、`long_window`、`direction`、`weight_ppm`。不适用的字段写 `null`，字符串使用小写枚举值。
+5. 对 canonical JSON 做 SHA-256，取小写十六进制前 16 位，生成 `custom:<hex16>`。
+
+示例 canonical JSON：
+
+```json
+{"schema_version":1,"engine_version":"custom-factor-v1","combine":"weighted_sum","normalize":"cross_section_rank","components":[{"kind":"momentum","field":"close","window":60,"short_window":null,"long_window":null,"direction":"higher","weight_ppm":550000},{"kind":"volatility","field":"close","window":20,"short_window":null,"long_window":null,"direction":"lower","weight_ppm":450000}]}
+```
 
 ### 计算流程
 
