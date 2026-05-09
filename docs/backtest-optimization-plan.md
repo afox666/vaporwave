@@ -15,6 +15,7 @@
 - 基准收益、超额收益、信息比率。
 - 持仓明细、换手率、因子 IC、五分组收益。
 - 因子缓存、结果缓存、任务队列、任务取消和任务状态持久化。
+- 专业模板工作台和结构化自定义因子定义。
 - 浏览器开发模式、Tauri release 和 CLI 均走 Zig sidecar。
 
 ## 数据前提
@@ -51,6 +52,7 @@
 | DONE | 回测结果缓存和同参任务去重 | `zig/src/main.zig` |
 | DONE | 回测任务并发控制和排队 | `zig/src/main.zig` |
 | DONE | 回测任务持久化和刷新恢复 | `zig/src/main.zig`, `frontend/src/views/Backtest.vue` |
+| DONE | 自定义因子模板、结构化校验和回测执行 | `zig/src/backtest_factor_specs.zig`, `zig/src/backtest_custom_factors.zig`, `zig/src/backtest.zig`, `frontend/src/views/Backtest.vue` |
 | DONE | Tauri sidecar 打包同步和 DuckDB 写锁治理 | `tauri-client.sh`, `server.sh`, `src-tauri/tauri.conf.json` |
 | DONE | 浏览器开发模式切换到 Zig sidecar | `server.sh`, `tauri-client.sh`, `frontend/vite.config.ts` |
 | DONE | 命令行入口切换到 `tauri-client.sh` | `tauri-client.sh` |
@@ -72,8 +74,9 @@
 1. 增加更丰富的基准指数口径，如沪深300、中证500、中证1000。
 2. 增加因子相关性矩阵、行业中性化和市值中性化。
 3. 增加样本内/样本外切分。
-4. 为 `tauri-client.sh backtest` 增加请求模板示例。
-5. 为 sidecar HTTP API 增加更细粒度的 Zig 单元或集成测试。
+4. 为 `POST /api/factors/validate` 的 `sample` 模式增加真实抽样样本率估计。
+5. 为 `tauri-client.sh backtest` 增加自定义因子请求模板示例。
+6. 为 sidecar HTTP API 增加更细粒度的 Zig 单元或集成测试。
 
 ## 验证建议
 

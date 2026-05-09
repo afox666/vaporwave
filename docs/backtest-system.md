@@ -14,11 +14,12 @@ Tauri dev/build 会先执行 `./tauri-client.sh ensure-sidecar`，确保 `zig/sr
 
 ## 前端请求
 
-`frontend/src/views/Backtest.vue` 通过 `frontend/src/api/index.ts` 优先发送 `POST /api/backtest/tasks` 创建异步任务，并轮询 `GET /api/backtest/tasks/{task_id}` 获取阶段进度和最终结果。同步回测仍由 `POST /api/backtest` 提供。
+`frontend/src/views/Backtest.vue` 通过 `frontend/src/api/index.ts` 优先发送 `POST /api/backtest/tasks` 创建异步任务，并轮询 `GET /api/backtest/tasks/{task_id}` 获取阶段进度和最终结果。同步回测仍由 `POST /api/backtest` 提供。自定义因子工作台会先调用 `GET /api/factor-templates` 读取专业模板，再调用 `POST /api/factors/validate` 校验结构化定义，最后随回测请求提交 `custom_factors`。
 
 主要参数包括：
 
-- `factors`：如 `momentum_20d`、`pe_percentile`、`rsi_14`。
+- `factors`：如 `momentum_20d`、`pe_percentile`、`rsi_14`，自定义因子使用 `custom:<hash>`。
+- `custom_factors`：可选，自定义因子的结构化定义，包含 `schema_version`、`engine_version`、`combine`、`normalize` 和白名单组件。
 - `start_date` / `end_date`：回测区间。
 - `rebalance_period`：调仓周期。
 - `top_pct` / `bottom_pct`：多空分位。
@@ -38,6 +39,8 @@ Tauri dev/build 会先执行 `./tauri-client.sh ensure-sidecar`，确保 `zig/sr
 - `POST /api/backtest/tasks/{task_id}/cancel`
 - `GET /api/backtest/history`
 - `GET /api/factors`
+- `GET /api/factor-templates`
+- `POST /api/factors/validate`
 
 任务接口会处理结果缓存、同参任务去重、队列、取消和任务状态持久化。已完成任务可在 sidecar 重启后继续查询；未完成任务会标记为 `failed/interrupted`，避免前端误判仍在运行。
 
@@ -50,8 +53,8 @@ Tauri dev/build 会先执行 `./tauri-client.sh ensure-sidecar`，确保 `zig/sr
 3. 生成调仓日期。
 4. 基于 DuckDB 历史成交额构建静态或动态股票池。
 5. 批量读取本地日 K 数据。
-6. 按需读取估值数据并计算因子。
-7. 读取和写入 `factor_daily` 因子缓存。
+6. 按需读取估值数据并计算内置因子，或按结构化定义计算自定义因子组件。
+7. 读取和写入内置因子的 `factor_daily` 因子缓存；自定义因子在当次股票池横截面内合成，避免跨股票池复用不一致。
 8. 构建多空组合，计算换手、交易成本、基准和超额收益。
 9. 计算组合指标、IC、五分组收益和数据质量报告。
 10. 写入 `.backtest_history/` 并返回 JSON。
@@ -74,6 +77,7 @@ DuckDB 主要表：
 `BacktestResult` 包含：
 
 - `config`：请求参数、股票池来源、数据覆盖范围、缓存统计。
+- `config.factor_labels` / `config.factor_definitions`：稳定因子 key 到展示名、结构化定义的映射。
 - `metrics`：总收益、年化收益、最大回撤、夏普、基准和超额指标。
 - `portfolio`：每期收益、净值、回撤、成本、换手、持仓明细。
 - `ic_analysis`：因子 IC 均值、标准差、ICIR 和正比例。

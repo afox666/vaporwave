@@ -1,34 +1,29 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+# macOS / editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-# Virtual environments
-.venv
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
 
-# Frontend
-frontend/node_modules/
-frontend/dist/
-frontend/tsconfig.tsbuildinfo
-.vite/
-
-# Cache
-.superpowers/
-.backtest_cache/
-.backtest_history/
-.backtest_result_cache/
-.backtest_tasks/
-
-# Market data database
-market_data.db
-market_data.db.wal
-market_data.db-shm
-celerybeat-schedule.db
-
-# Runtime pid files
+# Logs and process files
+*.log
+*.pid
+*.seed
+*.pid.lock
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 .server.pid
 .server.supervisor.pid
 .server.log
@@ -39,10 +34,71 @@ celerybeat-schedule.db
 .scheduler.log
 .scheduler-state
 
-# Native/build artifacts
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Node / Vue / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+frontend/.cache/
+frontend/tsconfig.tsbuildinfo
+node_modules/
+.vite/
+
+# Tauri / Rust
 src-tauri/target/
+src-tauri/gen/schemas/
+
+# Generated sidecar binaries
+src-tauri/sidecars/vaporwave-sidecar-*
+
+# Zig
+.zig-cache/
 zig/.zig-cache/
 zig/zig-out/
 zig/main
 zig/test
 zig/test2
+zig/*.o
+zig/*.a
+zig/*.dylib
+zig/*.so
+zig/*.dll
+zig/*.exe
+
+# Local market data and scheduler databases
+market_data.db
+market_data.db.*
+*.duckdb
+*.duckdb.*
+*.db-wal
+*.db-shm
+*.db.wal
+celerybeat-schedule.db
+celerybeat-schedule.db.*
+
+# Application caches and task state
+.superpowers/
+.claude/
+.codex/
+.backtest_cache/
+.backtest_history/
+.backtest_result_cache/
+.backtest_tasks/

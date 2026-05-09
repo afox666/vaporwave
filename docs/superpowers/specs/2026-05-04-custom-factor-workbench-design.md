@@ -81,12 +81,12 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 
 ```json
 {
-  "factors": ["custom:4f9a2c10d7b831aa"],
+  "factors": ["custom:7a1812bdc13ca752"],
   "custom_factors": [
     {
       "schema_version": 1,
       "engine_version": "custom-factor-v1",
-      "id": "custom:4f9a2c10d7b831aa",
+      "id": "custom:7a1812bdc13ca752",
       "name": "稳健动量",
       "description": "60日趋势动量 + 20日波动率惩罚",
       "combine": "weighted_sum",
@@ -145,7 +145,7 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 ```json
 {
   "mode": "schema",
-  "factors": ["custom:4f9a2c10d7b831aa"],
+  "factors": ["custom:7a1812bdc13ca752"],
   "custom_factors": [
     {
       "schema_version": 1,
@@ -199,13 +199,13 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
 ```json
 {
   "config": {
-    "factors": ["custom:4f9a2c10d7b831aa"],
+    "factors": ["custom:7a1812bdc13ca752"],
     "factor_labels": {
-      "custom:4f9a2c10d7b831aa": "稳健动量"
+      "custom:7a1812bdc13ca752": "稳健动量"
     },
     "factor_definitions": [
       {
-        "key": "custom:4f9a2c10d7b831aa",
+        "key": "custom:7a1812bdc13ca752",
         "name": "稳健动量",
         "description": "60日趋势动量 + 20日波动率惩罚",
         "schema_version": 1,
@@ -231,10 +231,10 @@ TradingView 只作为信息架构参考：顶部筛选、中心图表和表格�
     ]
   },
   "ic_analysis": {
-    "custom:4f9a2c10d7b831aa": {}
+    "custom:7a1812bdc13ca752": {}
   },
   "factor_research": {
-    "custom:4f9a2c10d7b831aa": {}
+    "custom:7a1812bdc13ca752": {}
   }
 }
 ```

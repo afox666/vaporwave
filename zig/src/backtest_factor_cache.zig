@@ -3,6 +3,7 @@ const duckdb = @import("duckdb.zig");
 const config = @import("backtest_config.zig");
 
 const Factor = config.Factor;
+const FactorSpec = config.FactorSpec;
 const parseFactor = config.parseFactor;
 const factorName = config.factorName;
 
@@ -57,16 +58,30 @@ fn stringListSql(allocator: std.mem.Allocator, values: []const []const u8) ![]u8
     return out.toOwnedSlice(allocator);
 }
 
-fn factorListSql(allocator: std.mem.Allocator, factors: []const Factor) ![]u8 {
+fn factorListSql(allocator: std.mem.Allocator, factors: []const FactorSpec) ![]u8 {
     var out = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
     errdefer out.deinit(allocator);
-    for (factors, 0..) |factor, i| {
-        if (i > 0) try out.appendSlice(allocator, ",");
-        const part = try std.fmt.allocPrint(allocator, "'{s}'", .{factorName(factor)});
+    var n: usize = 0;
+    for (factors) |factor| {
+        const builtin = switch (factor) {
+            .builtin => |b| b,
+            .custom => continue,
+        };
+        if (n > 0) try out.appendSlice(allocator, ",");
+        const part = try std.fmt.allocPrint(allocator, "'{s}'", .{factorName(builtin)});
         defer allocator.free(part);
         try out.appendSlice(allocator, part);
+        n += 1;
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn builtinFactorCount(factors: []const FactorSpec) usize {
+    var n: usize = 0;
+    for (factors) |factor| {
+        if (factor == .builtin) n += 1;
+    }
+    return n;
 }
 
 pub fn keyBuf(buf: []u8, symbol: []const u8, date: []const u8, factor: Factor) ![]const u8 {
@@ -78,13 +93,14 @@ pub fn load(
     db: *duckdb.Db,
     symbols: []const []const u8,
     dates: []const []const u8,
-    factors: []const Factor,
+    factors: []const FactorSpec,
 ) !Cache {
+    const builtin_count = builtinFactorCount(factors);
     const stats = Stats{
         .enabled = true,
-        .requested = symbols.len * dates.len * factors.len,
-        .misses = symbols.len * dates.len * factors.len,
-        .unavailable = symbols.len * dates.len * factors.len,
+        .requested = symbols.len * dates.len * builtin_count,
+        .misses = symbols.len * dates.len * builtin_count,
+        .unavailable = symbols.len * dates.len * builtin_count,
     };
     var cache = Cache.init(allocator, stats);
     errdefer cache.deinit(allocator);

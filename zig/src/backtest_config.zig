@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const factor_specs = @import("backtest_factor_specs.zig");
 
 pub const MAX_FACTORS = 9;
 
@@ -14,6 +15,53 @@ pub const Factor = enum {
     ma_deviation_20,
 };
 
+pub const FactorSpec = union(enum) {
+    builtin: Factor,
+    custom: factor_specs.CustomFactor,
+
+    pub fn deinit(self: *FactorSpec, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .builtin => {},
+            .custom => |*custom| custom.deinit(allocator),
+        }
+    }
+
+    pub fn isCustom(self: FactorSpec) bool {
+        return switch (self) {
+            .builtin => false,
+            .custom => true,
+        };
+    }
+
+    pub fn key(self: FactorSpec) []const u8 {
+        return switch (self) {
+            .builtin => |factor| factorName(factor),
+            .custom => |custom| custom.key,
+        };
+    }
+
+    pub fn label(self: FactorSpec) []const u8 {
+        return switch (self) {
+            .builtin => |factor| factorName(factor),
+            .custom => |custom| custom.name,
+        };
+    }
+
+    pub fn lookback(self: FactorSpec) usize {
+        return switch (self) {
+            .builtin => |factor| factorLookback(factor),
+            .custom => |custom| custom.lookback,
+        };
+    }
+
+    pub fn higherIsBetter(self: FactorSpec) bool {
+        return switch (self) {
+            .builtin => |factor| factor != .volatility_20d,
+            .custom => true,
+        };
+    }
+};
+
 pub const ExecutionMode = enum {
     close,
     next_open,
@@ -25,7 +73,7 @@ pub const PoolMode = enum {
 };
 
 pub const Request = struct {
-    factors: std.ArrayList(Factor),
+    factors: std.ArrayList(FactorSpec),
     start_date: []const u8,
     end_date: []const u8,
     rebalance_period: usize,
@@ -46,6 +94,7 @@ pub const Request = struct {
         allocator.free(self.start_date);
         allocator.free(self.end_date);
         if (self.industry) |industry| allocator.free(industry);
+        for (self.factors.items) |*factor| factor.deinit(allocator);
         self.factors.deinit(allocator);
     }
 };
@@ -58,14 +107,23 @@ pub fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !Request {
     if (parsed != .object) return error.BadRequest;
     const obj = parsed.object;
 
-    var factors = std.ArrayList(Factor){ .items = &.{}, .capacity = 0 };
-    errdefer factors.deinit(allocator);
+    var factors = std.ArrayList(FactorSpec){ .items = &.{}, .capacity = 0 };
+    errdefer {
+        for (factors.items) |*factor| factor.deinit(allocator);
+        factors.deinit(allocator);
+    }
     const factor_val = obj.get("factors") orelse return error.BadRequest;
     if (factor_val != .array) return error.BadRequest;
     for (factor_val.array.items) |item| {
         if (item != .string) return error.BadRequest;
-        const factor = parseFactor(item.string) orelse return error.UnknownFactor;
-        try factors.append(allocator, factor);
+        if (parseFactor(item.string)) |factor| {
+            try factors.append(allocator, FactorSpec{ .builtin = factor });
+        } else if (std.mem.startsWith(u8, item.string, "custom:")) {
+            const custom = try parseCustomFactorForKey(allocator, obj, item.string);
+            try factors.append(allocator, FactorSpec{ .custom = custom });
+        } else {
+            return error.UnknownFactor;
+        }
     }
     if (factors.items.len == 0 or factors.items.len > MAX_FACTORS) return error.BadRequest;
 
@@ -94,6 +152,20 @@ pub fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !Request {
         .execution_mode = parseExecutionMode(getString(obj, "execution_price") orelse "next_open"),
         .pool_mode = parsePoolMode(getString(obj, "pool_mode") orelse "dynamic"),
     };
+}
+
+fn parseCustomFactorForKey(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) !factor_specs.CustomFactor {
+    const val = obj.get("custom_factors") orelse return error.UnknownFactor;
+    if (val != .array) return error.BadRequest;
+    for (val.array.items) |item| {
+        var custom = factor_specs.parseCustomFactorValue(allocator, item) catch |err| switch (err) {
+            error.BadCustomFactor, error.DuplicateComponent => return error.BadRequest,
+            else => return err,
+        };
+        if (std.mem.eql(u8, custom.key, key)) return custom;
+        custom.deinit(allocator);
+    }
+    return error.UnknownFactor;
 }
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -192,15 +264,50 @@ pub fn factorLookback(factor: Factor) usize {
     };
 }
 
-pub fn maxLookback(factors: []const Factor) usize {
+pub fn maxLookback(factors: []const FactorSpec) usize {
     var out: usize = 30;
-    for (factors) |factor| out = @max(out, factorLookback(factor));
+    for (factors) |factor| out = @max(out, factor.lookback());
     return out;
 }
 
-pub fn hasFactor(factors: []const Factor, target: Factor) bool {
+pub fn hasFactor(factors: []const FactorSpec, target: Factor) bool {
     for (factors) |factor| {
-        if (factor == target) return true;
+        switch (factor) {
+            .builtin => |builtin| if (builtin == target) return true,
+            .custom => {},
+        }
     }
     return false;
+}
+
+pub fn factorSpecKey(factor: FactorSpec) []const u8 {
+    return factor.key();
+}
+
+pub fn factorSpecLabel(factor: FactorSpec) []const u8 {
+    return factor.label();
+}
+
+pub fn factorSpecHigherIsBetter(factor: FactorSpec) bool {
+    return factor.higherIsBetter();
+}
+
+test "parse request accepts custom factor specs" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"factors":["custom:7a1812bdc13ca752"],"custom_factors":[{"schema_version":1,"engine_version":"custom-factor-v1","name":"稳健动量","combine":"weighted_sum","normalize":"cross_section_rank","components":[{"kind":"momentum","field":"close","window":60,"direction":"higher","weight":0.55},{"kind":"volatility","field":"close","window":20,"direction":"lower","weight":0.45}]}],"start_date":"2024-01-01","end_date":"2026-05-01"}
+    ;
+    var req = try parseRequest(allocator, body);
+    defer req.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), req.factors.items.len);
+    try std.testing.expect(req.factors.items[0].isCustom());
+    try std.testing.expectEqualStrings("custom:7a1812bdc13ca752", req.factors.items[0].key());
+}
+
+test "parse request rejects custom factor key mismatch" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"factors":["custom:badbadbadbadbad1"],"custom_factors":[{"schema_version":1,"engine_version":"custom-factor-v1","name":"稳健动量","combine":"weighted_sum","normalize":"cross_section_rank","components":[{"kind":"momentum","field":"close","window":60,"direction":"higher","weight":0.55},{"kind":"volatility","field":"close","window":20,"direction":"lower","weight":0.45}]}],"start_date":"2024-01-01","end_date":"2026-05-01"}
+    ;
+    try std.testing.expectError(error.UnknownFactor, parseRequest(allocator, body));
 }

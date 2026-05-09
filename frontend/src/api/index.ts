@@ -25,8 +25,69 @@ export interface FactorInfo {
   higher_is_better: boolean
 }
 
+export type CustomFactorComponentKind =
+  | 'momentum'
+  | 'volatility'
+  | 'ma_deviation'
+  | 'volume_ratio'
+  | 'rsi'
+  | 'price_percentile'
+  | 'pe_percentile'
+
+export type CustomFactorField = 'close' | 'volume' | 'amount'
+export type CustomFactorDirection = 'higher' | 'lower'
+
+export interface CustomFactorComponent {
+  kind: CustomFactorComponentKind
+  field?: CustomFactorField | null
+  window?: number | null
+  short_window?: number | null
+  long_window?: number | null
+  direction: CustomFactorDirection
+  weight: number
+}
+
+export interface CustomFactorDefinition {
+  schema_version: number
+  engine_version: string
+  id?: string
+  name: string
+  description?: string
+  combine: 'weighted_sum'
+  normalize: 'cross_section_rank'
+  components: CustomFactorComponent[]
+}
+
+export interface FactorTemplate {
+  name: string
+  description: string
+  category: string
+  definition: CustomFactorDefinition
+}
+
+export interface FactorValidationResult {
+  mode: string
+  factor_key: string
+  factor_label: string
+  summary: string
+  schema_valid: boolean
+  lookback: number
+  engine_version: string
+  estimated_valid_observation_rate: number | null
+  component_missing_counts: Record<string, number>
+  sample_scope?: {
+    estimated?: boolean
+    symbols?: number
+    rebalance_dates?: number
+  }
+  warnings: string[]
+  errors: string[]
+  suggestions: string[]
+}
+
 export interface BacktestRequestConfig {
   factors: string[]
+  custom_factors?: CustomFactorDefinition[]
   start_date: string
   end_date: string
   rebalance_period?: number
@@ -46,6 +107,11 @@ export interface BacktestRequestConfig {
 
 export interface BacktestConfig {
   factors: string[]
+  factor_labels?: Record<string, string>
+  factor_definitions?: Array<CustomFactorDefinition & {
+    key?: string
+    lookback?: number
+  }>
   start_date: string
   end_date: string
   rebalance_period: number
@@ -423,6 +489,19 @@ export const getFactors = () =>
     data: Array.isArray(res.data) ? res.data : [],
   }))
 
+export const getFactorTemplates = () =>
+  request<FactorTemplate[]>('GET', '/factor-templates').then(res => ({
+    data: Array.isArray(res.data) ? res.data : [],
+  }))
+
+export const validateFactor = (payload: {
+  mode?: 'schema' | 'sample'
+  factors: string[]
+  custom_factors: CustomFactorDefinition[]
+  context?: Record<string, unknown>
+}) =>
+  request<FactorValidationResult>('POST', '/factors/validate', undefined, payload)
+
 export const runBacktest = (config: BacktestRequestConfig) =>
   request<BacktestResult>('POST', '/backtest', undefined, config)
 
@@ -501,6 +580,8 @@ export default {
   getStockFull,
   getPriceHistory,
   getFactors,
+  getFactorTemplates,
+  validateFactor,
   runBacktest,
   createBacktestTask,
   listBacktestTasks,

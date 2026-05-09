@@ -10,6 +10,7 @@ const baidu = @import("baidu.zig");
 const tencent = @import("tencent.zig");
 const duckdb = @import("duckdb.zig");
 const backtest = @import("backtest.zig");
+const backtest_config = @import("backtest_config.zig");
 const http = @import("http_helpers.zig");
 const result_cache = @import("backtest_result_cache.zig");
 const sql_text = @import("sql_text.zig");
@@ -1473,6 +1474,11 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         return;
     }
 
+    if (is_post and std.mem.eql(u8, uri, "/api/factors/validate")) {
+        try handle_factor_validate(allocator, stream, request_body);
+        return;
+    }
+
     if (is_post and std.mem.eql(u8, uri, "/api/backtest")) {
         try handle_backtest(allocator, stream, request_body, active_db, db_path);
         return;
@@ -1585,6 +1591,11 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     // GET /api/factors
     if (std.mem.eql(u8, uri, "/api/factors")) {
         try handle_factors(stream);
+        return;
+    }
+
+    if (std.mem.eql(u8, uri, "/api/factor-templates")) {
+        try handle_factor_templates(allocator, stream);
         return;
     }
 
@@ -4648,6 +4659,24 @@ fn handle_factors(stream: std.net.Stream) !void {
     try http.respond(stream, 200, body);
 }
 
+fn handle_factor_templates(allocator: std.mem.Allocator, stream: std.net.Stream) !void {
+    const body = backtest_config.factor_specs.templatesJson(allocator) catch {
+        try http.respondError(allocator, stream, 500, "failed to render factor templates");
+        return;
+    };
+    defer allocator.free(body);
+    try http.respond(stream, 200, body);
+}
+
+fn handle_factor_validate(allocator: std.mem.Allocator, stream: std.net.Stream, body: []const u8) !void {
+    const result = backtest_config.factor_specs.validateJson(allocator, body) catch {
+        try http.respondError(allocator, stream, 400, "invalid custom factor definition");
+        return;
+    };
+    defer allocator.free(result);
+    try http.respond(stream, 200, result);
+}
+
 test "weekly scan period rebuild deduplicates repeated trading dates" {
     const allocator = std.testing.allocator;
     const db_path = "/tmp/akshare_period_scan_test.db";
@@ -4753,4 +4782,16 @@ test "scan history detail query bounds rows by recorded daily total" {
     try std.testing.expectEqual(@as(usize, 3), rows.rows.items.len);
     try std.testing.expectEqualStrings("000001", rows.getStr(0, "symbol").?);
     try std.testing.expectEqualStrings("000003", rows.getStr(2, "symbol").?);
+}
+
+test "backtest request parses custom factor specs" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"factors":["custom:7a1812bdc13ca752"],"custom_factors":[{"schema_version":1,"engine_version":"custom-factor-v1","name":"稳健动量","combine":"weighted_sum","normalize":"cross_section_rank","components":[{"kind":"momentum","field":"close","window":60,"direction":"higher","weight":0.55},{"kind":"volatility","field":"close","window":20,"direction":"lower","weight":0.45}]}],"start_date":"2024-01-01","end_date":"2026-05-01"}
+    ;
+    var req = try backtest_config.parseRequest(allocator, body);
+    defer req.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), req.factors.items.len);
+    try std.testing.expect(req.factors.items[0].isCustom());
+    try std.testing.expectEqualStrings("custom:7a1812bdc13ca752", req.factors.items[0].key());
 }

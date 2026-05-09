@@ -3,19 +3,21 @@ const duckdb = @import("duckdb.zig");
 const baidu = @import("baidu.zig");
 const config = @import("backtest_config.zig");
 const factor_cache_config = @import("backtest_factor_cache.zig");
+const custom_factor_math = @import("backtest_custom_factors.zig");
 const factor_math = @import("backtest_factors.zig");
 const hook_config = @import("backtest_hooks.zig");
 const types = @import("backtest_types.zig");
 
 const MAX_FACTORS = config.MAX_FACTORS;
+const MAX_COMPONENTS = config.factor_specs.MAX_COMPONENTS;
 const Factor = config.Factor;
+const FactorSpec = config.FactorSpec;
 const Request = config.Request;
 const parseRequest = config.parseRequest;
 const isDate = config.isDate;
 const executionModeName = config.executionModeName;
 const poolModeName = config.poolModeName;
 const factorName = config.factorName;
-const higherIsBetter = config.higherIsBetter;
 const maxLookback = config.maxLookback;
 const hasFactor = config.hasFactor;
 
@@ -56,6 +58,7 @@ const Observation = struct {
     in_pool: bool = false,
     factors: [MAX_FACTORS]f64 = [_]f64{0} ** MAX_FACTORS,
     factor_scores: [MAX_FACTORS]f64 = [_]f64{0} ** MAX_FACTORS,
+    custom_components: [MAX_FACTORS][MAX_COMPONENTS]f64 = [_][MAX_COMPONENTS]f64{[_]f64{0} ** MAX_COMPONENTS} ** MAX_FACTORS,
     score: f64 = 0,
     tradable: bool = true,
     buyable: bool = true,
@@ -791,21 +794,32 @@ fn computeObservation(
     };
 
     for (req.factors.items, 0..) |factor, i| {
-        var key_buf: [96]u8 = undefined;
-        const key = factorCacheKeyBuf(&key_buf, stock.symbol, date, factor) catch return null;
-        const val = if (factor_cache.stats.enabled) factor_cache.values.get(key) orelse blk: {
-            const computed = computeFactor(stock, hist_idx, date, factor) orelse return null;
-            if (!std.math.isFinite(computed)) return null;
-            try factor_cache_records.append(allocator, FactorCacheRecord{
-                .symbol = stock.symbol,
-                .date = date,
-                .factor = factor,
-                .value = computed,
-            });
-            break :blk computed;
-        } else computeFactor(stock, hist_idx, date, factor) orelse return null;
-        if (!std.math.isFinite(val)) return null;
-        obs.factors[i] = val;
+        switch (factor) {
+            .builtin => |builtin| {
+                var key_buf: [96]u8 = undefined;
+                const key = factorCacheKeyBuf(&key_buf, stock.symbol, date, builtin) catch return null;
+                const val = if (factor_cache.stats.enabled) factor_cache.values.get(key) orelse blk: {
+                    const computed = computeFactor(stock, hist_idx, date, builtin) orelse return null;
+                    if (!std.math.isFinite(computed)) return null;
+                    try factor_cache_records.append(allocator, FactorCacheRecord{
+                        .symbol = stock.symbol,
+                        .date = date,
+                        .factor = builtin,
+                        .value = computed,
+                    });
+                    break :blk computed;
+                } else computeFactor(stock, hist_idx, date, builtin) orelse return null;
+                if (!std.math.isFinite(val)) return null;
+                obs.factors[i] = val;
+            },
+            .custom => |custom| {
+                for (custom.components, 0..) |component, ci| {
+                    const val = custom_factor_math.computeComponent(stock, hist_idx, date, component) orelse return null;
+                    if (!std.math.isFinite(val)) return null;
+                    obs.custom_components[i][ci] = val;
+                }
+            },
+        }
     }
     return obs;
 }
@@ -879,10 +893,12 @@ fn buildPortfolio(
         }
         if (group.items.len < 5) continue;
 
+        materializeCustomFactors(observations.items, group.items, req.factors.items);
+
         for (req.factors.items, 0..) |factor, fi| {
             for (group.items) |obs_idx| {
                 const pct = rankPct(observations.items, group.items, fi, obs_idx);
-                observations.items[obs_idx].factor_scores[fi] = if (higherIsBetter(factor)) pct else 1.0 - pct;
+                observations.items[obs_idx].factor_scores[fi] = if (factor.higherIsBetter()) pct else 1.0 - pct;
             }
         }
         for (group.items) |obs_idx| {
@@ -1013,6 +1029,38 @@ fn buildPortfolio(
     }
 
     return portfolio;
+}
+
+fn materializeCustomFactors(observations: []Observation, group: []const usize, factors: []const FactorSpec) void {
+    for (factors, 0..) |factor, fi| {
+        switch (factor) {
+            .builtin => {},
+            .custom => |custom| {
+                for (group) |obs_idx| {
+                    var score: f64 = 0;
+                    for (custom.components, 0..) |component, ci| {
+                        const pct = componentRankPct(observations, group, fi, ci, obs_idx);
+                        const directed = if (component.direction == .higher) pct else 1.0 - pct;
+                        score += directed * component.weight;
+                    }
+                    observations[obs_idx].factors[fi] = score;
+                }
+            },
+        }
+    }
+}
+
+fn componentRankPct(observations: []const Observation, group: []const usize, factor_index: usize, component_index: usize, target_idx: usize) f64 {
+    const value = observations[target_idx].custom_components[factor_index][component_index];
+    var less: usize = 0;
+    var equal: usize = 0;
+    for (group) |idx| {
+        const v = observations[idx].custom_components[factor_index][component_index];
+        if (v < value) less += 1;
+        if (v == value) equal += 1;
+    }
+    const avg_rank = @as(f64, @floatFromInt(less)) + (@as(f64, @floatFromInt(equal)) + 1.0) / 2.0;
+    return avg_rank / @as(f64, @floatFromInt(group.len));
 }
 
 const BenchmarkReturn = struct {
@@ -1264,7 +1312,7 @@ fn computeIc(
     allocator: std.mem.Allocator,
     observations: []const Observation,
     dates: []const []const u8,
-    factors: []const Factor,
+    factors: []const FactorSpec,
 ) ![]IcResult {
     var results = try allocator.alloc(IcResult, factors.len);
     for (factors, 0..) |factor, fi| {
@@ -1305,7 +1353,7 @@ fn computeIc(
     return results;
 }
 
-fn spearman(allocator: std.mem.Allocator, observations: []const Observation, group: []const usize, factor_index: usize, factor: Factor) ?f64 {
+fn spearman(allocator: std.mem.Allocator, observations: []const Observation, group: []const usize, factor_index: usize, factor: FactorSpec) ?f64 {
     var factor_ranks = allocator.alloc(f64, group.len) catch return null;
     defer allocator.free(factor_ranks);
     var return_ranks = allocator.alloc(f64, group.len) catch return null;
@@ -1318,9 +1366,9 @@ fn spearman(allocator: std.mem.Allocator, observations: []const Observation, gro
     return pearson(factor_ranks, return_ranks);
 }
 
-fn directedRankPct(observations: []const Observation, group: []const usize, factor_index: usize, target_idx: usize, factor: Factor) f64 {
+fn directedRankPct(observations: []const Observation, group: []const usize, factor_index: usize, target_idx: usize, factor: FactorSpec) f64 {
     const pct = rankPct(observations, group, factor_index, target_idx);
-    return if (higherIsBetter(factor)) pct else 1.0 - pct;
+    return if (factor.higherIsBetter()) pct else 1.0 - pct;
 }
 
 fn returnRankPct(observations: []const Observation, group: []const usize, target_idx: usize) f64 {
@@ -1406,8 +1454,12 @@ fn writeResult(
     try s.beginObject();
     try s.objectField("factors");
     try s.beginArray();
-    for (req.factors.items) |factor| try s.write(factorName(factor));
+    for (req.factors.items) |factor| try s.write(factor.key());
     try s.endArray();
+    try s.objectField("factor_labels");
+    try writeFactorLabels(s, req.factors.items);
+    try s.objectField("factor_definitions");
+    try writeFactorDefinitions(s, req.factors.items);
     try s.objectField("start_date");
     try s.write(req.start_date);
     try s.objectField("end_date");
@@ -1537,7 +1589,7 @@ fn writeResult(
     try s.objectField("ic_analysis");
     try s.beginObject();
     for (req.factors.items, 0..) |factor, i| {
-        try s.objectField(factorName(factor));
+        try s.objectField(factor.key());
         try s.beginObject();
         try s.objectField("ic_mean");
         try s.write(ic_results[i].mean);
@@ -1580,7 +1632,70 @@ fn writeFactorCacheStats(s: *std.json.Stringify, stats: FactorCacheStats) !void 
     try s.endObject();
 }
 
-fn writeHoldings(s: *std.json.Stringify, holdings: []const Holding, factors: []const Factor) !void {
+fn writeFactorLabels(s: *std.json.Stringify, factors: []const FactorSpec) !void {
+    try s.beginObject();
+    for (factors) |factor| {
+        try s.objectField(factor.key());
+        try s.write(factor.label());
+    }
+    try s.endObject();
+}
+
+fn writeFactorDefinitions(s: *std.json.Stringify, factors: []const FactorSpec) !void {
+    try s.beginArray();
+    for (factors) |factor| {
+        try s.beginObject();
+        try s.objectField("key");
+        try s.write(factor.key());
+        try s.objectField("name");
+        try s.write(factor.label());
+        try s.objectField("lookback");
+        try s.write(factor.lookback());
+        switch (factor) {
+            .builtin => |builtin| {
+                try s.objectField("type");
+                try s.write("builtin");
+                try s.objectField("description");
+                try s.write(factorName(builtin));
+            },
+            .custom => |custom| {
+                try s.objectField("type");
+                try s.write("custom");
+                try s.objectField("description");
+                try s.write(custom.description);
+                try s.objectField("schema_version");
+                try s.write(custom.schema_version);
+                try s.objectField("engine_version");
+                try s.write(custom.engine_version);
+                try s.objectField("components");
+                try s.beginArray();
+                for (custom.components) |component| {
+                    try s.beginObject();
+                    try s.objectField("kind");
+                    try s.write(config.factor_specs.componentKindName(component.kind));
+                    try s.objectField("field");
+                    if (component.field) |field| try s.write(config.factor_specs.fieldName(field)) else try s.write(null);
+                    try s.objectField("window");
+                    if (component.window) |window| try s.write(window) else try s.write(null);
+                    try s.objectField("short_window");
+                    if (component.short_window) |window| try s.write(window) else try s.write(null);
+                    try s.objectField("long_window");
+                    if (component.long_window) |window| try s.write(window) else try s.write(null);
+                    try s.objectField("direction");
+                    try s.write(config.factor_specs.directionName(component.direction));
+                    try s.objectField("weight");
+                    try s.write(component.weight);
+                    try s.endObject();
+                }
+                try s.endArray();
+            },
+        }
+        try s.endObject();
+    }
+    try s.endArray();
+}
+
+fn writeHoldings(s: *std.json.Stringify, holdings: []const Holding, factors: []const FactorSpec) !void {
     try s.beginArray();
     for (holdings) |holding| {
         try s.beginObject();
@@ -1605,14 +1720,14 @@ fn writeHoldings(s: *std.json.Stringify, holdings: []const Holding, factors: []c
         try s.objectField("factors");
         try s.beginObject();
         for (factors, 0..) |factor, i| {
-            try s.objectField(factorName(factor));
+            try s.objectField(factor.key());
             try s.write(holding.factors[i]);
         }
         try s.endObject();
         try s.objectField("factor_scores");
         try s.beginObject();
         for (factors, 0..) |factor, i| {
-            try s.objectField(factorName(factor));
+            try s.objectField(factor.key());
             try s.write(holding.factor_scores[i]);
         }
         try s.endObject();
@@ -1626,11 +1741,11 @@ fn writeFactorResearch(
     allocator: std.mem.Allocator,
     observations: []const Observation,
     dates: []const []const u8,
-    factors: []const Factor,
+    factors: []const FactorSpec,
 ) !void {
     try s.beginObject();
     for (factors, 0..) |factor, fi| {
-        try s.objectField(factorName(factor));
+        try s.objectField(factor.key());
         try s.beginObject();
         try s.objectField("observation_count");
         try s.write(countPoolObservations(observations));
@@ -2052,7 +2167,7 @@ fn saveHistory(allocator: std.mem.Allocator, workspace_dir: []const u8, req: Req
     try s.write(id);
     try s.objectField("factors");
     try s.beginArray();
-    for (req.factors.items) |factor| try s.write(factorName(factor));
+    for (req.factors.items) |factor| try s.write(factor.key());
     try s.endArray();
     try s.objectField("start");
     try s.write(req.start_date);
@@ -2085,7 +2200,7 @@ fn saveHistory(allocator: std.mem.Allocator, workspace_dir: []const u8, req: Req
     try s.beginObject();
     try s.objectField("factor_names");
     try s.beginArray();
-    for (req.factors.items) |factor| try s.write(factorName(factor));
+    for (req.factors.items) |factor| try s.write(factor.key());
     try s.endArray();
     try s.objectField("start_date");
     try s.write(req.start_date);

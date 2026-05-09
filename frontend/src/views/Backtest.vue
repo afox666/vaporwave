@@ -1,11 +1,21 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
-import { cancelBacktestTask, createBacktestTask, getBacktestTask, getFactors, listBacktestTasks, runBacktest } from '../api'
+import { cancelBacktestTask, createBacktestTask, getBacktestTask, getFactorTemplates, getFactors, listBacktestTasks, runBacktest, validateFactor } from '../api'
 import CRTFrame from '../components/CRTFrame.vue'
-import type { FactorInfo, BacktestRequestConfig, BacktestResult, BacktestTaskStatus } from '../api'
+import type {
+  BacktestRequestConfig,
+  BacktestResult,
+  BacktestTaskStatus,
+  CustomFactorComponent,
+  CustomFactorDefinition,
+  FactorInfo,
+  FactorTemplate,
+  FactorValidationResult,
+} from '../api'
 
 const factors = ref<FactorInfo[]>([])
+const factorTemplates = ref<FactorTemplate[]>([])
 const loading = ref(false)
 const result = ref<BacktestResult | null>(null)
 const errorMessage = ref('')
@@ -13,6 +23,10 @@ const taskId = ref('')
 const taskStatus = ref<BacktestTaskStatus | null>(null)
 const expandedHoldingRows = ref<Set<string>>(new Set())
 const selectedResearchFactor = ref('')
+const customFactorDraft = ref<CustomFactorDefinition | null>(null)
+const customFactorValidation = ref<FactorValidationResult | null>(null)
+const customFactorValidating = ref(false)
+const activeTemplateName = ref('')
 
 const netValueChartRef = ref<HTMLElement | null>(null)
 const drawdownChartRef = ref<HTMLElement | null>(null)
@@ -27,6 +41,7 @@ let icChart: echarts.ECharts | null = null
 let quintileChart: echarts.ECharts | null = null
 let taskPollTimer: ReturnType<typeof window.setTimeout> | null = null
 const LAST_BACKTEST_TASK_KEY = 'vaporwave:lastBacktestTaskId'
+const FACTOR_DRAFT_KEY = 'vaporwave:backtest:customFactorDraft:v1'
 
 // Form
 const selectedFactors = ref<string[]>([])
@@ -62,9 +77,30 @@ const categoryLabels: Record<string, string> = {
   technical: '技术指标因子',
 }
 
+const componentLabels: Record<string, string> = {
+  momentum: '趋势动量',
+  volatility: '价格波动率',
+  ma_deviation: '均线偏离',
+  volume_ratio: '量能放大',
+  rsi: 'RSI强弱',
+  price_percentile: '价格历史分位',
+  pe_percentile: 'PE历史分位',
+}
+
 const researchFactorNames = computed(() => Object.keys(result.value?.factor_research || {}))
 const taskProgress = computed(() => Math.round((taskStatus.value?.progress || 0) * 100))
 const taskProgressWidth = computed(() => `${Math.max(0, Math.min(100, taskProgress.value))}%`)
+const customFactorKey = computed(() => customFactorValidation.value?.factor_key || customFactorDraft.value?.id || '')
+const selectedCustomKey = computed(() => selectedFactors.value.find(isCustomFactorKey) || '')
+const customFactorSelected = computed(() => !!customFactorKey.value && selectedFactors.value.includes(customFactorKey.value))
+const customFactorStatus = computed(() => {
+  if (customFactorValidating.value) return 'checking'
+  if (!customFactorDraft.value) return 'idle'
+  if (!customFactorValidation.value) return 'idle'
+  if (customFactorValidation.value.errors?.length) return 'fail'
+  if (customFactorValidation.value.warnings?.length) return 'warn'
+  return customFactorValidation.value.schema_valid ? 'pass' : 'fail'
+})
 const canCancelTask = computed(() => (
   loading.value
   && !!taskId.value
@@ -77,6 +113,223 @@ function qualityStatusLabel(status?: string): string {
   if (status === 'warn') return '注意'
   if (status === 'fail') return '失败'
   return '--'
+}
+
+function isCustomFactorKey(name: string): boolean {
+  return name.startsWith('custom:')
+}
+
+function cloneDefinition(definition: CustomFactorDefinition): CustomFactorDefinition {
+  return JSON.parse(JSON.stringify(definition)) as CustomFactorDefinition
+}
+
+function factorDisplayName(name: string): string {
+  const labels = result.value?.config.factor_labels || {}
+  if (labels[name]) return labels[name]
+  if (customFactorKey.value === name && customFactorDraft.value?.name) return customFactorDraft.value.name
+  const builtin = factors.value.find(item => item.name === name)
+  return builtin?.name || name
+}
+
+function componentDisplayName(component: CustomFactorComponent): string {
+  return componentLabels[component.kind] || component.kind
+}
+
+function componentDirectionLabel(direction: string): string {
+  return direction === 'lower' ? '越低越好' : '越高越好'
+}
+
+function componentParamLabel(component: CustomFactorComponent): string {
+  if (component.kind === 'pe_percentile') return '使用可得PE历史'
+  if (component.kind === 'volume_ratio') return `${component.short_window || '--'} / ${component.long_window || '--'} 日`
+  if (component.window) return `${component.window} 日`
+  return '--'
+}
+
+function componentStatus(component: CustomFactorComponent): string {
+  if (component.kind === 'pe_percentile') return '可运行'
+  if (component.kind === 'volume_ratio') {
+    if (!component.short_window || !component.long_window) return '缺少窗口'
+    return component.short_window < component.long_window ? '可运行' : '短期需小于长期'
+  }
+  return component.window && component.window > 0 ? '可运行' : '缺少窗口'
+}
+
+function weightPercent(component: CustomFactorComponent): number {
+  return Math.round((component.weight || 0) * 100)
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.max(min, Math.min(max, value))
+}
+
+function validationStatusLabel(): string {
+  if (customFactorStatus.value === 'checking') return '校验中'
+  if (customFactorStatus.value === 'pass') return '可运行'
+  if (customFactorStatus.value === 'warn') return '有提示'
+  if (customFactorStatus.value === 'fail') return '不可运行'
+  return '待选择'
+}
+
+function saveCustomFactorDraft() {
+  if (!customFactorDraft.value) return
+  try {
+    window.localStorage.setItem(FACTOR_DRAFT_KEY, JSON.stringify({
+      schema_version: 1,
+      saved_at: new Date().toISOString(),
+      custom_factors: [cloneDefinition(customFactorDraft.value)],
+      ui: { active_template: activeTemplateName.value },
+    }))
+  } catch {
+    // localStorage may be unavailable in restricted webviews.
+  }
+}
+
+function restoreCustomFactorDraft(): boolean {
+  try {
+    const raw = window.localStorage.getItem(FACTOR_DRAFT_KEY)
+    if (!raw) return false
+    const payload = JSON.parse(raw)
+    const definition = payload?.custom_factors?.[0]
+    if (payload?.schema_version !== 1 || !definition) return false
+    customFactorDraft.value = cloneDefinition(definition)
+    activeTemplateName.value = payload?.ui?.active_template || definition.name || ''
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function selectFactorTemplate(template: FactorTemplate) {
+  customFactorDraft.value = cloneDefinition(template.definition)
+  activeTemplateName.value = template.name
+  customFactorValidation.value = null
+  saveCustomFactorDraft()
+  await validateCustomFactor('schema')
+}
+
+function currentValidateContext(): Record<string, unknown> {
+  return {
+    start_date: startDate.value,
+    end_date: endDate.value,
+    rebalance_period: rebalancePeriod.value,
+    pool_size: poolSize.value,
+    pool_mode: poolMode.value,
+    industry: null,
+    min_amount: minAmount.value,
+    min_listed_days: minListedDays.value,
+    limit_pct: limitPct.value,
+  }
+}
+
+async function validateCustomFactor(mode: 'schema' | 'sample' = 'schema'): Promise<FactorValidationResult | null> {
+  if (!customFactorDraft.value) return null
+  const beforeKey = customFactorKey.value
+  customFactorValidating.value = true
+  try {
+    const draft = cloneDefinition(customFactorDraft.value)
+    draft.id = draft.id || customFactorValidation.value?.factor_key || 'custom:pending'
+    const res = await validateFactor({
+      mode,
+      factors: [draft.id],
+      custom_factors: [draft],
+      context: currentValidateContext(),
+    })
+    customFactorValidation.value = res.data
+    if (res.data.factor_key && customFactorDraft.value) {
+      customFactorDraft.value.id = res.data.factor_key
+      syncSelectedCustomFactorKey(beforeKey, res.data.factor_key)
+      saveCustomFactorDraft()
+    }
+    return res.data
+  } catch (e: any) {
+    customFactorValidation.value = {
+      mode,
+      factor_key: beforeKey,
+      factor_label: customFactorDraft.value.name,
+      summary: '自定义因子校验失败',
+      schema_valid: false,
+      lookback: 0,
+      engine_version: customFactorDraft.value.engine_version,
+      estimated_valid_observation_rate: null,
+      component_missing_counts: {},
+      warnings: [],
+      errors: [getErrorMessage(e)],
+      suggestions: ['重新选择模板或检查参数范围'],
+    }
+    return null
+  } finally {
+    customFactorValidating.value = false
+  }
+}
+
+function validateDraftSchema() {
+  saveCustomFactorDraft()
+  void validateCustomFactor('schema')
+}
+
+function syncSelectedCustomFactorKey(oldKey: string, newKey: string) {
+  if (!newKey) return
+  const hadSelectedCustom = !!oldKey && selectedFactors.value.includes(oldKey)
+  if (!hadSelectedCustom && !selectedFactors.value.some(isCustomFactorKey)) return
+  selectedFactors.value = selectedFactors.value.filter(name => !isCustomFactorKey(name))
+  selectedFactors.value.push(newKey)
+}
+
+async function addCustomFactorToBacktest() {
+  const validation = await validateCustomFactor('schema')
+  if (!validation?.schema_valid || !validation.factor_key || validation.errors.length) {
+    errorMessage.value = validation?.errors?.[0] || '自定义因子还不能加入回测'
+    return
+  }
+  selectedFactors.value = selectedFactors.value.filter(name => !isCustomFactorKey(name))
+  selectedFactors.value.push(validation.factor_key)
+  errorMessage.value = ''
+}
+
+function removeCustomFactorFromBacktest() {
+  selectedFactors.value = selectedFactors.value.filter(name => !isCustomFactorKey(name))
+}
+
+async function previewCustomFactor() {
+  await validateCustomFactor('sample')
+}
+
+function updateComponentWindow(index: number, event: Event) {
+  const component = customFactorDraft.value?.components[index]
+  if (!component) return
+  component.window = clampNumber(Number((event.target as HTMLInputElement).value), 5, 250)
+  validateDraftSchema()
+}
+
+function updateComponentShortWindow(index: number, event: Event) {
+  const component = customFactorDraft.value?.components[index]
+  if (!component) return
+  component.short_window = clampNumber(Number((event.target as HTMLInputElement).value), 2, 120)
+  validateDraftSchema()
+}
+
+function updateComponentLongWindow(index: number, event: Event) {
+  const component = customFactorDraft.value?.components[index]
+  if (!component) return
+  component.long_window = clampNumber(Number((event.target as HTMLInputElement).value), 5, 250)
+  validateDraftSchema()
+}
+
+function updateComponentWeight(index: number, event: Event) {
+  const component = customFactorDraft.value?.components[index]
+  if (!component) return
+  const pct = clampNumber(Number((event.target as HTMLInputElement).value), 1, 99)
+  component.weight = pct / 100
+  validateDraftSchema()
+}
+
+function customFactorDefinitionsForRequest(): CustomFactorDefinition[] | undefined {
+  if (!customFactorDraft.value || !selectedCustomKey.value) return undefined
+  const definition = cloneDefinition(customFactorDraft.value)
+  definition.id = selectedCustomKey.value
+  return [definition]
 }
 
 function toggleFactor(name: string) {
@@ -92,6 +345,13 @@ async function runTest() {
   if (selectedFactors.value.length === 0) {
     errorMessage.value = '请至少选择一个因子'
     return
+  }
+  if (selectedFactors.value.some(isCustomFactorKey)) {
+    const validation = await validateCustomFactor('sample')
+    if (!validation?.schema_valid || validation.errors.length) {
+      errorMessage.value = validation?.errors?.[0] || '自定义因子校验未通过'
+      return
+    }
   }
   stopTaskPolling()
   loading.value = true
@@ -118,7 +378,7 @@ async function runTest() {
 }
 
 function makeBacktestConfig(): BacktestRequestConfig {
-  return {
+  const config: BacktestRequestConfig = {
     factors: [...selectedFactors.value],
     start_date: startDate.value,
     end_date: endDate.value,
@@ -134,6 +394,9 @@ function makeBacktestConfig(): BacktestRequestConfig {
     limit_pct: limitPct.value,
     execution_price: executionPrice.value,
   }
+  const customFactors = customFactorDefinitionsForRequest()
+  if (customFactors?.length) config.custom_factors = customFactors
+  return config
 }
 
 function getErrorMessage(e: any): string {
@@ -178,6 +441,13 @@ function getRememberedBacktestTask(): string {
 
 function applyBacktestConfigToForm(config: BacktestRequestConfig) {
   selectedFactors.value = Array.isArray(config.factors) ? [...config.factors] : []
+  if (Array.isArray(config.custom_factors) && config.custom_factors.length > 0) {
+    customFactorDraft.value = cloneDefinition(config.custom_factors[0])
+    activeTemplateName.value = customFactorDraft.value.name
+    customFactorValidation.value = null
+    saveCustomFactorDraft()
+    void validateCustomFactor('schema')
+  }
   startDate.value = config.start_date || startDate.value
   endDate.value = config.end_date || endDate.value
   rebalancePeriod.value = config.rebalance_period ?? rebalancePeriod.value
@@ -462,16 +732,17 @@ function buildIcChart() {
   icChart = getOrInitChart(icChartRef.value, icChart)
   if (!icChart) return
   const dates = Array.from(new Set(names.flatMap(name => research[name].ic_series.map(point => point.date?.substring(0, 10)))))
+  const displayNames = names.map(name => factorDisplayName(name))
   icChart.setOption({
     ...chartBaseOption(),
-    legend: { ...(chartBaseOption().legend as object), data: names },
+    legend: { ...(chartBaseOption().legend as object), data: displayNames },
     xAxis: { ...(chartBaseOption().xAxis as object), data: dates },
     yAxis: { ...(chartBaseOption().yAxis as object), min: -1, max: 1 },
     series: names.map((name, idx) => {
       const values = new Map(research[name].ic_series.map(point => [point.date?.substring(0, 10), point.ic]))
       const colors = ['#ff3b8d', '#00fff7', '#ffd166', '#7cff6b', '#b388ff', '#ff7a59']
       return {
-        name,
+        name: factorDisplayName(name),
         type: 'line',
         smooth: true,
         showSymbol: false,
@@ -489,13 +760,14 @@ function buildQuintileChart() {
   if (!item) return
   quintileChart = getOrInitChart(quintileChartRef.value, quintileChart)
   if (!quintileChart) return
+  const displayName = factorDisplayName(current)
   quintileChart.setOption({
     ...chartBaseOption(),
-    legend: { ...(chartBaseOption().legend as object), data: [current] },
+    legend: { ...(chartBaseOption().legend as object), data: [displayName] },
     xAxis: { ...(chartBaseOption().xAxis as object), data: ['Q1', 'Q2', 'Q3', 'Q4', 'Q5'] },
     series: [
       {
-        name: current,
+        name: displayName,
         type: 'bar',
         data: item.quintile_returns,
         itemStyle: {
@@ -533,8 +805,15 @@ function handleResize() {
 
 onMounted(async () => {
   try {
-    const res = await getFactors()
-    factors.value = res.data
+    const [factorRes, templateRes] = await Promise.all([getFactors(), getFactorTemplates()])
+    factors.value = factorRes.data
+    factorTemplates.value = templateRes.data
+    const restored = restoreCustomFactorDraft()
+    if (restored) {
+      await validateCustomFactor('schema')
+    } else if (factorTemplates.value.length > 0) {
+      await selectFactorTemplate(factorTemplates.value[0])
+    }
   } catch (e) {
     console.error(e)
   }
@@ -558,27 +837,176 @@ watch(selectedResearchFactor, () => {
     <h2 class="section-title">&#x26A1; 因子回测控制台</h2>
 
     <div class="grid-2">
-      <!-- Factor Selection -->
-      <CRTFrame title="FACTOR SELECTION">
-        <div v-for="(group, category) in groupedFactors" :key="category" class="mb-3">
-          <div style="color: #8070b0; font-size: 0.9rem; margin-bottom: 0.5rem">
-            {{ categoryLabels[category] || category }}
+      <!-- Factor Workbench -->
+      <CRTFrame title="FACTOR WORKBENCH">
+        <div class="workbench-head">
+          <div>
+            <div class="workbench-kicker">自定义因子</div>
+            <strong>{{ customFactorDraft?.name || '选择专业模板' }}</strong>
           </div>
-          <div class="factor-toggles">
-            <button
-              v-for="f in group"
-              :key="f.name"
-              class="factor-toggle"
-              :class="{ active: selectedFactors.includes(f.name) }"
-              @click="toggleFactor(f.name)"
-            >
-              <span class="toggle-name">{{ f.name }}</span>
-              <span class="toggle-desc">{{ f.description }}</span>
+          <span :class="`validation-pill ${customFactorStatus}`">{{ validationStatusLabel() }}</span>
+        </div>
+
+        <div class="template-strip" v-if="factorTemplates.length">
+          <button
+            v-for="template in factorTemplates"
+            :key="template.name"
+            class="template-button"
+            :class="{ active: activeTemplateName === template.name }"
+            @click="selectFactorTemplate(template)"
+          >
+            <span>{{ template.name }}</span>
+            <small>{{ template.description }}</small>
+          </button>
+        </div>
+
+        <div v-if="customFactorDraft" class="factor-workbench">
+          <div class="factor-name-row">
+            <label>因子名称</label>
+            <input v-model="customFactorDraft.name" type="text" class="vapor-input" @change="validateDraftSchema" />
+          </div>
+
+          <table class="factor-param-table">
+            <thead>
+              <tr>
+                <th>维度</th>
+                <th>参数</th>
+                <th>方向</th>
+                <th>权重</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(component, index) in customFactorDraft.components" :key="`${component.kind}-${index}`">
+                <td>
+                  <strong>{{ componentDisplayName(component) }}</strong>
+                  <small>{{ component.kind }}</small>
+                </td>
+                <td>
+                  <div v-if="component.kind === 'volume_ratio'" class="window-pair">
+                    <input
+                      :value="component.short_window || 5"
+                      type="number"
+                      class="vapor-input compact-input"
+                      min="2"
+                      max="120"
+                      @change="updateComponentShortWindow(index, $event)"
+                    />
+                    <span>/</span>
+                    <input
+                      :value="component.long_window || 20"
+                      type="number"
+                      class="vapor-input compact-input"
+                      min="5"
+                      max="250"
+                      @change="updateComponentLongWindow(index, $event)"
+                    />
+                  </div>
+                  <span v-else-if="component.kind === 'pe_percentile'" class="readonly-param">
+                    {{ componentParamLabel(component) }}
+                  </span>
+                  <input
+                    v-else
+                    :value="component.window || 20"
+                    type="number"
+                    class="vapor-input compact-input"
+                    min="5"
+                    max="250"
+                    @change="updateComponentWindow(index, $event)"
+                  />
+                </td>
+                <td>
+                  <select v-model="component.direction" class="vapor-input direction-select" @change="validateDraftSchema">
+                    <option value="higher">越高越好</option>
+                    <option value="lower">越低越好</option>
+                  </select>
+                </td>
+                <td>
+                  <input
+                    :value="weightPercent(component)"
+                    type="number"
+                    class="vapor-input compact-input"
+                    min="1"
+                    max="99"
+                    step="1"
+                    @change="updateComponentWeight(index, $event)"
+                  />
+                  <span class="unit-label">%</span>
+                </td>
+                <td :class="componentStatus(component) === '可运行' ? 'positive' : 'negative'">
+                  {{ componentStatus(component) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="factor-summary">
+            {{ customFactorValidation?.summary || '选择模板后，系统会生成可回测的结构化因子定义。' }}
+          </div>
+
+          <div class="validation-panel" :class="customFactorStatus">
+            <div class="detail-row">
+              <span>标准Key</span>
+              <span>{{ customFactorKey || '--' }}</span>
+            </div>
+            <div class="detail-row">
+              <span>最大历史需求</span>
+              <span>{{ customFactorValidation?.lookback ?? '--' }} 交易日</span>
+            </div>
+            <div class="detail-row">
+              <span>引擎版本</span>
+              <span>{{ customFactorValidation?.engine_version || customFactorDraft.engine_version }}</span>
+            </div>
+            <div v-if="customFactorValidation?.warnings?.length" class="validation-lines warn">
+              <span v-for="item in customFactorValidation.warnings" :key="item">{{ item }}</span>
+            </div>
+            <div v-if="customFactorValidation?.errors?.length" class="validation-lines fail">
+              <span v-for="item in customFactorValidation.errors" :key="item">{{ item }}</span>
+            </div>
+            <div v-if="customFactorValidation?.suggestions?.length" class="validation-lines">
+              <span v-for="item in customFactorValidation.suggestions" :key="item">{{ item }}</span>
+            </div>
+          </div>
+
+          <div class="workbench-actions">
+            <button class="neon-btn" @click="previewCustomFactor" :disabled="customFactorValidating">
+              先看因子效果
+            </button>
+            <button class="neon-btn primary" @click="addCustomFactorToBacktest" :disabled="customFactorValidating">
+              {{ customFactorSelected ? '已加入回测' : '加入回测' }}
+            </button>
+            <button v-if="selectedCustomKey" class="neon-btn" @click="removeCustomFactorFromBacktest">
+              移除自定义
             </button>
           </div>
         </div>
 
-        <div class="mt-2" style="color: #6050a0; font-size: 0.85rem">
+        <div class="builtin-factor-section">
+          <div class="workbench-subtitle">内置因子</div>
+          <div v-for="(group, category) in groupedFactors" :key="category" class="mb-3">
+            <div class="factor-category">
+              {{ categoryLabels[category] || category }}
+            </div>
+            <div class="factor-toggles">
+              <button
+                v-for="f in group"
+                :key="f.name"
+                class="factor-toggle"
+                :class="{ active: selectedFactors.includes(f.name) }"
+                @click="toggleFactor(f.name)"
+              >
+                <span class="toggle-name">{{ f.name }}</span>
+                <span class="toggle-desc">{{ f.description }}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="selected-factor-strip" v-if="selectedFactors.length">
+          <span v-for="name in selectedFactors" :key="name">{{ factorDisplayName(name) }}</span>
+        </div>
+
+        <div class="mt-2 selected-count">
           已选: {{ selectedFactors.length }} 个因子
         </div>
       </CRTFrame>
@@ -838,7 +1266,7 @@ watch(selectedResearchFactor, () => {
           <CRTFrame title="QUINTILE RETURNS" class="chart-wide">
             <div v-if="researchFactorNames.length > 1" class="chart-control">
               <select v-model="selectedResearchFactor" class="vapor-input">
-                <option v-for="name in researchFactorNames" :key="name" :value="name">{{ name }}</option>
+                <option v-for="name in researchFactorNames" :key="name" :value="name">{{ factorDisplayName(name) }}</option>
               </select>
             </div>
             <div ref="quintileChartRef" class="backtest-chart compact"></div>
@@ -850,7 +1278,7 @@ watch(selectedResearchFactor, () => {
       <div class="mt-4" v-if="result.ic_analysis && Object.keys(result.ic_analysis).length > 0">
         <h3 class="section-title">因子IC分析</h3>
         <div class="grid-2">
-          <CRTFrame v-for="(ic, fname) in result.ic_analysis" :key="fname" :title="fname">
+          <CRTFrame v-for="(ic, fname) in result.ic_analysis" :key="fname" :title="factorDisplayName(String(fname))">
             <div class="detail-row">
               <span>IC均值</span>
               <span :style="{ color: ic.ic_mean >= 0 ? '#ff3b3b' : '#00c853' }">{{ fmtNum(ic.ic_mean) }}</span>
@@ -935,7 +1363,7 @@ watch(selectedResearchFactor, () => {
       <div class="mt-4" v-if="result.factor_research && Object.keys(result.factor_research).length > 0">
         <h3 class="section-title">因子研究</h3>
         <div class="grid-2">
-          <CRTFrame v-for="(research, fname) in result.factor_research" :key="fname" :title="fname">
+          <CRTFrame v-for="(research, fname) in result.factor_research" :key="fname" :title="factorDisplayName(String(fname))">
             <div class="detail-row">
               <span>观测数</span><span>{{ research.observation_count }}</span>
             </div>
@@ -957,6 +1385,252 @@ watch(selectedResearchFactor, () => {
 </template>
 
 <style scoped>
+.workbench-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+  margin-bottom: 0.9rem;
+  font-family: var(--font-terminal);
+  color: #d8ccff;
+}
+
+.workbench-kicker,
+.workbench-subtitle,
+.factor-category {
+  color: #8070b0;
+  font-size: 0.85rem;
+}
+
+.workbench-head strong {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 1.08rem;
+}
+
+.validation-pill {
+  min-width: 5.5rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid #bf00ff45;
+  text-align: center;
+  font-family: var(--font-terminal);
+  font-size: 0.86rem;
+  color: #9f91cc;
+  background: rgba(10, 5, 30, 0.48);
+}
+
+.validation-pill.pass {
+  color: var(--neon-cyan);
+  border-color: #00fff760;
+}
+
+.validation-pill.warn,
+.validation-panel.warn {
+  color: #ffd166;
+  border-color: #ffd16670;
+}
+
+.validation-pill.fail,
+.validation-panel.fail {
+  color: #ff4466;
+  border-color: #ff446670;
+}
+
+.template-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin-bottom: 0.9rem;
+}
+
+.template-button {
+  min-height: 76px;
+  padding: 0.65rem;
+  border: 1px solid #bf00ff30;
+  background: rgba(191, 0, 255, 0.07);
+  color: #c8b8ff;
+  cursor: pointer;
+  font-family: var(--font-terminal);
+  text-align: left;
+  transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+.template-button:hover,
+.template-button.active {
+  border-color: var(--neon-cyan);
+  background: rgba(0, 255, 247, 0.09);
+  color: var(--neon-cyan);
+}
+
+.template-button span,
+.template-button small {
+  display: block;
+}
+
+.template-button span {
+  margin-bottom: 0.25rem;
+  font-weight: 700;
+}
+
+.template-button small {
+  color: #8f82bc;
+  line-height: 1.35;
+}
+
+.factor-workbench {
+  border-top: 1px solid #bf00ff22;
+  border-bottom: 1px solid #bf00ff22;
+  padding: 0.85rem 0;
+}
+
+.factor-name-row {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.8rem;
+}
+
+.factor-name-row label {
+  font-family: var(--font-terminal);
+  color: #8070b0;
+}
+
+.factor-param-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-family: var(--font-terminal);
+}
+
+.factor-param-table th,
+.factor-param-table td {
+  padding: 0.5rem 0.4rem;
+  border-bottom: 1px solid #bf00ff18;
+  vertical-align: middle;
+  color: #c8b8ff;
+}
+
+.factor-param-table th {
+  color: #8070b0;
+  font-weight: 400;
+  text-align: left;
+}
+
+.factor-param-table td strong,
+.factor-param-table td small {
+  display: block;
+}
+
+.factor-param-table td small {
+  margin-top: 0.15rem;
+  color: #70649c;
+  font-size: 0.78rem;
+}
+
+.compact-input {
+  width: 74px;
+  max-width: 100%;
+}
+
+.direction-select {
+  width: 112px;
+}
+
+.window-pair {
+  display: inline-grid;
+  grid-template-columns: 64px auto 64px;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.readonly-param,
+.unit-label {
+  color: #8070b0;
+  font-family: var(--font-terminal);
+}
+
+.factor-summary {
+  margin-top: 0.8rem;
+  padding: 0.65rem;
+  border: 1px solid #00fff730;
+  background: rgba(0, 255, 247, 0.05);
+  color: #d8ccff;
+  font-family: var(--font-terminal);
+  line-height: 1.45;
+}
+
+.validation-panel {
+  margin-top: 0.75rem;
+  padding: 0.65rem;
+  border: 1px solid #bf00ff30;
+  background: rgba(10, 5, 30, 0.48);
+}
+
+.validation-panel .detail-row > span:last-child {
+  max-width: 62%;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.validation-lines {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.55rem;
+  color: #c8b8ff;
+  font-family: var(--font-terminal);
+  font-size: 0.9rem;
+}
+
+.validation-lines.warn {
+  color: #ffd166;
+}
+
+.validation-lines.fail {
+  color: #ff4466;
+}
+
+.workbench-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 0.85rem;
+}
+
+.builtin-factor-section {
+  margin-top: 1rem;
+}
+
+.workbench-subtitle {
+  margin-bottom: 0.6rem;
+  font-family: var(--font-terminal);
+}
+
+.factor-category {
+  margin-bottom: 0.5rem;
+}
+
+.selected-factor-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
+
+.selected-factor-strip span {
+  padding: 0.28rem 0.5rem;
+  border: 1px solid #00fff735;
+  color: var(--neon-cyan);
+  background: rgba(0, 255, 247, 0.06);
+  font-family: var(--font-terminal);
+  font-size: 0.86rem;
+}
+
+.selected-count {
+  color: #6050a0;
+  font-size: 0.85rem;
+}
+
 .factor-toggles {
   display: flex;
   flex-wrap: wrap;
@@ -994,7 +1668,7 @@ watch(selectedResearchFactor, () => {
 .toggle-name {
   font-family: var(--font-retro);
   font-size: 0.75rem;
-  letter-spacing: 1px;
+  letter-spacing: 0;
 }
 
 .toggle-desc {
@@ -1014,7 +1688,7 @@ watch(selectedResearchFactor, () => {
   font-family: var(--font-retro);
   font-size: 0.75rem;
   color: #8070b0;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 
@@ -1255,6 +1929,18 @@ watch(selectedResearchFactor, () => {
   .quality-check-list,
   .chart-grid {
     grid-template-columns: 1fr;
+  }
+
+  .template-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .factor-param-table {
+    min-width: 640px;
+  }
+
+  .factor-workbench {
+    overflow-x: auto;
   }
 
   .backtest-actions {

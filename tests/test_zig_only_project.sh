@@ -64,7 +64,9 @@ scan_periods_source="$(< frontend/src/views/ScanPeriods.vue)"
 
 for module in \
   zig/src/backtest_config.zig \
+  zig/src/backtest_custom_factors.zig \
   zig/src/backtest_factor_cache.zig \
+  zig/src/backtest_factor_specs.zig \
   zig/src/backtest_factors.zig \
   zig/src/backtest_hooks.zig \
   zig/src/backtest_result_cache.zig \
@@ -80,6 +82,7 @@ backtest_source="$(< zig/src/backtest.zig)"
 main_source="$(< zig/src/main.zig)"
 
 [[ "$backtest_source" == *'@import("backtest_config.zig")'* ]] || fail "backtest.zig does not import backtest_config.zig"
+[[ "$backtest_source" == *'@import("backtest_custom_factors.zig")'* ]] || fail "backtest.zig does not import backtest_custom_factors.zig"
 [[ "$backtest_source" == *'@import("backtest_factor_cache.zig")'* ]] || fail "backtest.zig does not import backtest_factor_cache.zig"
 [[ "$backtest_source" == *'@import("backtest_factors.zig")'* ]] || fail "backtest.zig does not import backtest_factors.zig"
 [[ "$backtest_source" == *'@import("backtest_hooks.zig")'* ]] || fail "backtest.zig does not import backtest_hooks.zig"
@@ -89,9 +92,29 @@ main_source="$(< zig/src/main.zig)"
 [[ "$main_source" == *'@import("backtest_task_files.zig")'* ]] || fail "main.zig does not import backtest_task_files.zig"
 [[ "$main_source" == *'@import("sql_text.zig")'* ]] || fail "main.zig does not import sql_text.zig"
 
-(
-  cd zig
-  zig build test
-) || fail "zig build test failed"
+duckdb_lib=""
+for dir in /opt/homebrew/opt/duckdb/lib /opt/homebrew/lib /usr/local/opt/duckdb/lib /usr/local/lib; do
+  if [[ -f "$dir/libduckdb.dylib" ]]; then
+    duckdb_lib="$dir/libduckdb.dylib"
+    break
+  fi
+done
+[[ -n "$duckdb_lib" ]] || fail "missing libduckdb.dylib for Zig tests"
+
+if [[ "$(uname -s)" == "Darwin" && -d /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk ]]; then
+  (
+    cd zig
+    zig test src/main.zig \
+      --sysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk \
+      -lc \
+      "$duckdb_lib" \
+      -rpath "$(dirname "$duckdb_lib")"
+  ) || fail "zig test failed"
+else
+  (
+    cd zig
+    zig build test
+  ) || fail "zig build test failed"
+fi
 
 printf 'Zig-only project shape verified\n'
