@@ -11,7 +11,7 @@ import StockHistory from '../views/StockHistory.vue'
 const isTauri = typeof window !== 'undefined' && window.location.protocol === 'tauri:'
 
 const router = createRouter({
-  history: isTauri ? createMemoryHistory() : createWebHistory(),
+  history: isTauri ? createMemoryHistory() : createWebHistory(import.meta.env.BASE_URL),
   routes: [
     { path: '/', component: Dashboard },
     { path: '/scan', component: Scan },

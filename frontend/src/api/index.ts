@@ -435,10 +435,10 @@ async function request<T>(method: string, path: string, params?: Record<string, 
     return { data: json }
   }
 
-  // Browser dev mode: use axios through Vite proxy to the Zig sidecar.
+  const apiBase = import.meta.env.VITE_API_BASE_URL ?? ''
   const resp = await axios({
     method,
-    url: `/api${path}`,
+    url: `${apiBase}/api${path}`,
     params,
     data: body,
     timeout: 120000,
