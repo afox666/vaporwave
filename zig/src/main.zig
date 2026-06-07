@@ -1454,6 +1454,11 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     const method = line_iter.next() orelse return;
     const uri = line_iter.next() orelse return;
 
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        try http.respondOptions(stream);
+        return;
+    }
+
     const is_get = std.mem.eql(u8, method, "GET");
     const is_post = std.mem.eql(u8, method, "POST");
 

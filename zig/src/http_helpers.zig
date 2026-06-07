@@ -48,9 +48,22 @@ pub fn respondError(allocator: std.mem.Allocator, stream: std.net.Stream, status
     try respond(stream, status, body);
 }
 
+pub fn respondOptions(stream: std.net.Stream) !void {
+    try stream.writeAll(
+        "HTTP/1.1 204 No Content\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
+            "Access-Control-Allow-Headers: Content-Type\r\n" ++
+            "Access-Control-Max-Age: 86400\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+}
+
 pub fn respond(stream: std.net.Stream, status: u16, body: []const u8) !void {
     const status_text = switch (status) {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
