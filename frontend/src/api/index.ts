@@ -383,6 +383,7 @@ export interface ScanPeriodRebuildResult {
 // --- Tauri support ---
 
 let _sidecarUrl: string | null = null
+const browserApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 
 /**
  * Initialize Tauri HTTP client. Call this before making API requests in Tauri.
@@ -405,6 +406,10 @@ function buildUrl(path: string, params?: Record<string, unknown>): string {
     }
   }
   return url.toString()
+}
+
+function buildBrowserUrl(path: string): string {
+  return browserApiBaseUrl ? `${browserApiBaseUrl}/api${path}` : `/api${path}`
 }
 
 /**
@@ -435,10 +440,10 @@ async function request<T>(method: string, path: string, params?: Record<string, 
     return { data: json }
   }
 
-  const apiBase = import.meta.env.VITE_API_BASE_URL ?? ''
+  // Browser mode: use Vite proxy locally, or VITE_API_BASE_URL for static hosting.
   const resp = await axios({
     method,
-    url: `${apiBase}/api${path}`,
+    url: buildBrowserUrl(path),
     params,
     data: body,
     timeout: 120000,

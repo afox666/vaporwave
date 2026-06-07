@@ -1,4 +1,4 @@
-import { createMemoryHistory, createRouter, createWebHistory } from 'vue-router'
+import { createMemoryHistory, createRouter, createWebHashHistory, createWebHistory } from 'vue-router'
 import Backtest from '../views/Backtest.vue'
 import Dashboard from '../views/Dashboard.vue'
 import History from '../views/History.vue'
@@ -9,9 +9,14 @@ import StockDetail from '../views/StockDetail.vue'
 import StockHistory from '../views/StockHistory.vue'
 
 const isTauri = typeof window !== 'undefined' && window.location.protocol === 'tauri:'
+const useStaticRouter = import.meta.env.VITE_ROUTER_MODE === 'hash'
 
 const router = createRouter({
-  history: isTauri ? createMemoryHistory() : createWebHistory(import.meta.env.BASE_URL),
+  history: isTauri
+    ? createMemoryHistory()
+    : useStaticRouter
+      ? createWebHashHistory(import.meta.env.BASE_URL)
+      : createWebHistory(import.meta.env.BASE_URL),
   routes: [
     { path: '/', component: Dashboard },
     { path: '/scan', component: Scan },
