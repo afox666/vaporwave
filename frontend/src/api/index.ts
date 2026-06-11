@@ -383,7 +383,59 @@ export interface ScanPeriodRebuildResult {
 // --- Tauri support ---
 
 let _sidecarUrl: string | null = null
-const browserApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const API_BASE_STORAGE_KEY = 'vaporwave.apiBaseUrl'
+const defaultBrowserApiBaseUrl = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL || '')
+
+export function normalizeApiBaseUrl(value: string): string {
+  let next = value.trim()
+  if (!next) return ''
+  if (!/^https?:\/\//i.test(next) && !next.startsWith('/')) {
+    next = `https://${next}`
+  }
+  next = next.replace(/\/+$/, '')
+  return next.replace(/\/api$/i, '')
+}
+
+export function getDefaultBrowserApiBaseUrl(): string {
+  return defaultBrowserApiBaseUrl
+}
+
+export function getStoredBrowserApiBaseUrl(): string {
+  if (typeof window === 'undefined') return ''
+  try {
+    return normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY) || '')
+  } catch {
+    return ''
+  }
+}
+
+export function setStoredBrowserApiBaseUrl(value: string): string {
+  const normalized = normalizeApiBaseUrl(value)
+  if (typeof window === 'undefined') return normalized
+  try {
+    if (normalized) {
+      window.localStorage.setItem(API_BASE_STORAGE_KEY, normalized)
+    } else {
+      window.localStorage.removeItem(API_BASE_STORAGE_KEY)
+    }
+  } catch {
+    // localStorage may be unavailable in restricted webviews.
+  }
+  return normalized
+}
+
+export function clearStoredBrowserApiBaseUrl(): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.removeItem(API_BASE_STORAGE_KEY)
+  } catch {
+    // localStorage may be unavailable in restricted webviews.
+  }
+}
+
+export function getEffectiveBrowserApiBaseUrl(): string {
+  return getStoredBrowserApiBaseUrl() || defaultBrowserApiBaseUrl
+}
 
 /**
  * Initialize Tauri HTTP client. Call this before making API requests in Tauri.
@@ -409,6 +461,7 @@ function buildUrl(path: string, params?: Record<string, unknown>): string {
 }
 
 function buildBrowserUrl(path: string): string {
+  const browserApiBaseUrl = getEffectiveBrowserApiBaseUrl()
   return browserApiBaseUrl ? `${browserApiBaseUrl}/api${path}` : `/api${path}`
 }
 
