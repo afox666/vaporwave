@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
+  getScanAccuracy,
   getScanHistory,
   getScanHistoryDetail,
   getScanPeriodDetail,
@@ -11,6 +12,8 @@ import {
 } from '../api'
 import CRTFrame from '../components/CRTFrame.vue'
 import type {
+  ScanAccuracyResult,
+  ScanAccuracyStock,
   ScanHistoryItem,
   ScanHistoryStock,
   ScanPeriod,
@@ -30,12 +33,15 @@ const periods = ref<ScanPeriodItem[]>([])
 const selectedPeriodStart = ref('')
 const periodDetail = ref<ScanPeriodDetail | null>(null)
 const periodStocks = ref<ScanPeriodStock[]>([])
+const accuracy = ref<ScanAccuracyResult | null>(null)
 const loadingDates = ref(true)
 const loadingDetail = ref(false)
 const loadingPeriods = ref(false)
 const loadingPeriodDetail = ref(false)
+const loadingAccuracy = ref(false)
 const triggering = ref(false)
 const rebuilding = ref(false)
+let accuracyRequestId = 0
 
 const tabs: { key: ViewMode; label: string }[] = [
   { key: 'day', label: '日' },
@@ -56,6 +62,13 @@ const periodRankingTitle = computed(() => {
   const detail = periodDetail.value
   if (!detail) return `${periodLabels[activePeriod.value]} RANKING`
   return `${detail.period_start} ~ ${detail.period_end} ${periodLabels[activePeriod.value]}`
+})
+const accuracyStockBySymbol = computed(() => {
+  const map = new Map<string, ScanAccuracyStock>()
+  for (const stock of accuracy.value?.stocks || []) {
+    map.set(stock.symbol, stock)
+  }
+  return map
 })
 
 async function loadDates(preferLatest = false) {
@@ -98,26 +111,61 @@ async function loadPeriods(period: ScanPeriod, preferLatest = false) {
       selectedPeriodStart.value = ''
       periodDetail.value = null
       periodStocks.value = []
+      accuracy.value = null
     }
   } catch (e) {
     console.error(e)
     periods.value = []
     periodStocks.value = []
+    accuracy.value = null
   }
   loadingPeriods.value = false
+}
+
+async function loadAccuracy(periodStart: string) {
+  if (mode.value !== 'week') {
+    accuracyRequestId += 1
+    accuracy.value = null
+    loadingAccuracy.value = false
+    return
+  }
+  const requestId = ++accuracyRequestId
+  loadingAccuracy.value = true
+  try {
+    const res = await getScanAccuracy({
+      period: 'week',
+      period_start: periodStart,
+      top_n: 20,
+      bucket_count: 5,
+    })
+    if (mode.value === 'week' && selectedPeriodStart.value === periodStart) {
+      accuracy.value = res.data
+    }
+  } catch (e) {
+    console.error(e)
+    if (selectedPeriodStart.value === periodStart) {
+      accuracy.value = null
+    }
+  }
+  if (requestId === accuracyRequestId) {
+    loadingAccuracy.value = false
+  }
 }
 
 async function selectPeriod(periodStart: string) {
   selectedPeriodStart.value = periodStart
   loadingPeriodDetail.value = true
+  accuracy.value = null
   try {
     const res = await getScanPeriodDetail(activePeriod.value, periodStart)
     periodDetail.value = res.data
     periodStocks.value = res.data.stocks
+    await loadAccuracy(periodStart)
   } catch (e) {
     console.error(e)
     periodDetail.value = null
     periodStocks.value = []
+    accuracy.value = null
   }
   loadingPeriodDetail.value = false
 }
@@ -125,12 +173,18 @@ async function selectPeriod(periodStart: string) {
 async function switchMode(next: ViewMode) {
   mode.value = next
   if (next === 'day') {
+    accuracyRequestId += 1
+    accuracy.value = null
+    loadingAccuracy.value = false
     if (dates.value.length === 0) await loadDates()
     return
   }
   selectedPeriodStart.value = ''
   periodDetail.value = null
   periodStocks.value = []
+  accuracyRequestId += 1
+  accuracy.value = null
+  loadingAccuracy.value = false
   await loadPeriods(next, true)
 }
 
@@ -194,8 +248,22 @@ function fmtSigned(value: number | null | undefined, digits = 2, suffix = '') {
   return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}${suffix}`
 }
 
+function fmtRate(value: number | null | undefined, digits = 1) {
+  if (value == null || !Number.isFinite(value)) return '--'
+  return `${(value * 100).toFixed(digits)}%`
+}
+
 function periodRange(item: ScanPeriodItem) {
   return `${item.period_start} ~ ${item.period_end}`
+}
+
+function accuracyFor(stock: ScanPeriodStock) {
+  return accuracyStockBySymbol.value.get(stock.symbol)
+}
+
+function rankDeltaClass(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return ''
+  return value <= 0 ? 'positive' : 'negative'
 }
 
 onMounted(() => {
@@ -383,6 +451,103 @@ onMounted(() => {
                 <span>数据 {{ periodDetail.data_start }} ~ {{ periodDetail.data_end }}</span>
               </div>
 
+              <CRTFrame v-if="activePeriod === 'week' && (loadingAccuracy || accuracy)" title="WEEKLY ACCURACY" class="mb-3">
+                <div v-if="loadingAccuracy" class="loading-glitch accuracy-loading">LOADING ACCURACY...</div>
+                <template v-else-if="accuracy">
+                  <div class="accuracy-meta">
+                    <span>{{ accuracy.summary.entry_date }} → {{ accuracy.summary.as_of }}</span>
+                    <span>有效 {{ accuracy.summary.evaluated_count }} / {{ accuracy.summary.ranked_count }}</span>
+                    <span>缺失 {{ accuracy.summary.missing_count }}</span>
+                    <span>{{ accuracy.summary.price_source }}</span>
+                  </div>
+
+                  <div class="accuracy-metrics">
+                    <div class="accuracy-metric">
+                      <span>准确度</span>
+                      <strong>{{ fmt(accuracy.metrics.accuracy_score, 1) }}</strong>
+                    </div>
+                    <div class="accuracy-metric">
+                      <span>Rank IC</span>
+                      <strong>{{ fmt(accuracy.metrics.rank_ic, 3) }}</strong>
+                    </div>
+                    <div class="accuracy-metric">
+                      <span>Top20 超额</span>
+                      <strong :class="(accuracy.metrics.top_excess_return_pct ?? 0) >= 0 ? 'positive' : 'negative'">
+                        {{ fmtSigned(accuracy.metrics.top_excess_return_pct, 2, '%') }}
+                      </strong>
+                    </div>
+                    <div class="accuracy-metric">
+                      <span>Top20 正收益</span>
+                      <strong>{{ fmtRate(accuracy.metrics.top_positive_rate, 1) }}</strong>
+                    </div>
+                    <div class="accuracy-metric">
+                      <span>Top20 跑赢</span>
+                      <strong>{{ fmtRate(accuracy.metrics.top_outperform_rate, 1) }}</strong>
+                    </div>
+                    <div class="accuracy-metric">
+                      <span>分层单调</span>
+                      <strong>{{ fmt(accuracy.metrics.monotonicity_score, 1) }}</strong>
+                    </div>
+                  </div>
+
+                  <div class="accuracy-subgrid">
+                    <div>
+                      <div class="accuracy-subtitle">分层收益</div>
+                      <div class="table-scroll">
+                        <table class="vapor-table compact-table">
+                          <thead>
+                            <tr>
+                              <th>组</th>
+                              <th>排名</th>
+                              <th>样本</th>
+                              <th>均涨幅</th>
+                              <th>正收益</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="bucket in accuracy.buckets" :key="bucket.bucket">
+                              <td>Q{{ bucket.bucket }}</td>
+                              <td>{{ bucket.rank_start }}-{{ bucket.rank_end }}</td>
+                              <td>{{ bucket.sample_count }}</td>
+                              <td :class="(bucket.avg_return_pct ?? 0) >= 0 ? 'positive' : 'negative'">
+                                {{ fmtSigned(bucket.avg_return_pct, 2, '%') }}
+                              </td>
+                              <td>{{ fmtRate(bucket.positive_rate, 1) }}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div class="accuracy-subtitle">权重诊断</div>
+                      <div class="table-scroll">
+                        <table class="vapor-table compact-table">
+                          <thead>
+                            <tr>
+                              <th>组件</th>
+                              <th>权重</th>
+                              <th>相关</th>
+                              <th>建议</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="component in accuracy.components" :key="component.key">
+                              <td>{{ component.label }}</td>
+                              <td>{{ fmt(component.weight, 0) }}</td>
+                              <td :class="(component.correlation ?? 0) >= 0 ? 'positive' : 'negative'">
+                                {{ fmt(component.correlation, 3) }}
+                              </td>
+                              <td>{{ component.suggestion }}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </CRTFrame>
+
               <div v-if="periodStocks.length >= 3" class="grid-3 mb-3">
                 <div
                   v-for="stock in periodStocks.slice(0, 3)"
@@ -420,6 +585,9 @@ onMounted(() => {
                         <th>上榜</th>
                         <th>均排</th>
                         <th>区间涨幅</th>
+                        <th v-if="activePeriod === 'week'">验证涨幅</th>
+                        <th v-if="activePeriod === 'week'">实际排名</th>
+                        <th v-if="activePeriod === 'week'">排名偏差</th>
                         <th>评分变化</th>
                         <th>行业</th>
                       </tr>
@@ -441,6 +609,18 @@ onMounted(() => {
                         <td>{{ fmt(stock.avg_rank, 1) }}</td>
                         <td :class="(stock.return_pct ?? 0) >= 0 ? 'positive' : 'negative'">
                           {{ fmtSigned(stock.return_pct, 2, '%') }}
+                        </td>
+                        <td
+                          v-if="activePeriod === 'week'"
+                          :class="(accuracyFor(stock)?.validation_return_pct ?? 0) >= 0 ? 'positive' : 'negative'"
+                        >
+                          {{ fmtSigned(accuracyFor(stock)?.validation_return_pct, 2, '%') }}
+                        </td>
+                        <td v-if="activePeriod === 'week'">
+                          {{ fmt(accuracyFor(stock)?.actual_rank, 0) }}
+                        </td>
+                        <td v-if="activePeriod === 'week'" :class="rankDeltaClass(accuracyFor(stock)?.rank_delta)">
+                          {{ fmtSigned(accuracyFor(stock)?.rank_delta, 0) }}
                         </td>
                         <td :class="(stock.score_delta ?? 0) >= 0 ? 'positive' : 'negative'">
                           {{ fmtSigned(stock.score_delta, 1) }}
@@ -578,6 +758,74 @@ onMounted(() => {
   overflow-x: auto;
 }
 
+.accuracy-loading {
+  padding: 0.75rem 0;
+}
+
+.accuracy-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-bottom: 0.9rem;
+  color: #8070b0;
+  font-family: var(--font-terminal);
+  font-size: 0.84rem;
+}
+
+.accuracy-meta span {
+  border: 1px solid #00fff730;
+  background: rgba(0, 255, 247, 0.04);
+  padding: 0.3rem 0.5rem;
+}
+
+.accuracy-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(94px, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.accuracy-metric {
+  min-height: 64px;
+  border: 1px solid #bf00ff30;
+  background: rgba(191, 0, 255, 0.05);
+  padding: 0.55rem 0.65rem;
+}
+
+.accuracy-metric span {
+  display: block;
+  color: #8070b0;
+  font-family: var(--font-terminal);
+  font-size: 0.78rem;
+  margin-bottom: 0.35rem;
+}
+
+.accuracy-metric strong {
+  color: var(--neon-cyan);
+  font-family: var(--font-retro);
+  font-size: 1.15rem;
+  font-weight: 400;
+}
+
+.accuracy-subgrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 1rem;
+}
+
+.accuracy-subtitle {
+  color: var(--neon-cyan);
+  font-family: var(--font-retro);
+  font-size: 0.86rem;
+  margin-bottom: 0.55rem;
+}
+
+.compact-table th,
+.compact-table td {
+  padding: 0.42rem 0.5rem;
+  white-space: nowrap;
+}
+
 .empty-state {
   text-align: center;
   padding: 2rem;
@@ -608,6 +856,11 @@ onMounted(() => {
 
   .period-actions {
     justify-content: flex-start;
+  }
+
+  .accuracy-metrics,
+  .accuracy-subgrid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

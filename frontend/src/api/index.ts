@@ -380,11 +380,89 @@ export interface ScanPeriodRebuildResult {
   rebuilt: number
 }
 
+export interface ScanAccuracySummary {
+  period: 'week'
+  period_start: string
+  period_end: string
+  data_start: string
+  entry_date: string
+  as_of: string
+  price_source: string
+  top_n: number
+  bucket_count: number
+  candidate_count: number
+  ranked_count: number
+  evaluated_count: number
+  missing_count: number
+  scan_days: number
+}
+
+export interface ScanAccuracyMetrics {
+  accuracy_score: number
+  rank_ic: number | null
+  score_ic: number | null
+  avg_return_pct: number | null
+  median_return_pct: number | null
+  top_return_pct: number | null
+  top_excess_return_pct: number | null
+  top_positive_rate: number | null
+  top_outperform_rate: number | null
+  monotonicity_score: number | null
+}
+
+export interface ScanAccuracyBucket {
+  bucket: number
+  rank_start: number
+  rank_end: number
+  sample_count: number
+  avg_return_pct: number | null
+  positive_rate: number | null
+}
+
+export interface ScanAccuracyComponent {
+  key: string
+  label: string
+  weight: number
+  sample_count: number
+  avg_score: number | null
+  correlation: number | null
+  suggestion: string
+}
+
+export interface ScanAccuracyStock {
+  rank: number
+  symbol: string
+  name: string
+  industry: string
+  period_score: number
+  appearances: number
+  avg_rank: number
+  avg_daily_score: number
+  score_delta: number
+  in_period_return_pct: number | null
+  entry_price: number | null
+  eval_price: number | null
+  validation_return_pct: number | null
+  actual_rank: number | null
+  rank_delta: number | null
+}
+
+export interface ScanAccuracyResult {
+  summary: ScanAccuracySummary
+  metrics: ScanAccuracyMetrics
+  buckets: ScanAccuracyBucket[]
+  components: ScanAccuracyComponent[]
+  stocks: ScanAccuracyStock[]
+}
+
 // --- Tauri support ---
 
 let _sidecarUrl: string | null = null
 const API_BASE_STORAGE_KEY = 'vaporwave.apiBaseUrl'
 const defaultBrowserApiBaseUrl = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL || '')
+const BROWSER_API_HOST_ALIASES: Record<string, string> = {
+  'auto.hylabpowered.com': 'cu.hylabpowered.com',
+}
 
 export function normalizeApiBaseUrl(value: string): string {
   let next = value.trim()
@@ -393,7 +471,18 @@ export function normalizeApiBaseUrl(value: string): string {
     next = `https://${next}`
   }
   next = next.replace(/\/+$/, '')
-  return next.replace(/\/api$/i, '')
+  next = next.replace(/\/api$/i, '')
+  try {
+    const url = new URL(next)
+    const alias = BROWSER_API_HOST_ALIASES[url.hostname]
+    if (alias) {
+      url.hostname = alias
+      return url.toString().replace(/\/+$/, '')
+    }
+  } catch {
+    // Relative API bases such as /vaporwave are valid in static deployments.
+  }
+  return next
 }
 
 export function getDefaultBrowserApiBaseUrl(): string {
@@ -628,6 +717,29 @@ export const getScanPeriodDetail = (period: ScanPeriod, periodStart: string) =>
 export const rebuildScanPeriods = (period: ScanPeriodRequest = 'all', topN = 100) =>
   request<ScanPeriodRebuildResult>('POST', '/scan/periods/rebuild', { period, top_n: topN })
 
+export const getScanAccuracy = (params: {
+  period?: 'week'
+  period_start?: string
+  as_of?: string
+  top_n?: number
+  bucket_count?: number
+} = {}) =>
+  request<ScanAccuracyResult>('GET', '/scan/accuracy', {
+    period: params.period || 'week',
+    period_start: params.period_start,
+    as_of: params.as_of,
+    top_n: params.top_n ?? 20,
+    bucket_count: params.bucket_count ?? 5,
+  }).then(res => ({
+    data: {
+      summary: res.data.summary,
+      metrics: res.data.metrics,
+      buckets: Array.isArray(res.data.buckets) ? res.data.buckets : [],
+      components: Array.isArray(res.data.components) ? res.data.components : [],
+      stocks: Array.isArray(res.data.stocks) ? res.data.stocks : [],
+    },
+  }))
+
 export default {
   scanMarket,
   searchStock,
@@ -653,6 +765,7 @@ export default {
   getScanPeriods,
   getScanPeriodDetail,
   rebuildScanPeriods,
+  getScanAccuracy,
   initTauri,
   isTauriRuntime,
 }

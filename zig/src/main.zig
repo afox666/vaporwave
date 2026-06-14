@@ -206,6 +206,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var port: u16 = 8000;
+    var listen_host: []const u8 = "127.0.0.1";
     var db_path: ?[]const u8 = null;
     var sync_command: ?[]const u8 = null;
     var job_command: ?[]const u8 = null;
@@ -219,6 +220,9 @@ pub fn main() !void {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             port = std.fmt.parseInt(u16, args[i + 1], 10) catch 8000;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+            listen_host = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--db") and i + 1 < args.len) {
             db_path = args[i + 1];
@@ -304,11 +308,11 @@ pub fn main() !void {
     backtest_task_store.init(allocator);
     defer backtest_task_store.deinit();
 
-    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    const address = try std.net.Address.parseIp4(listen_host, port);
     var server = try address.listen(.{ .reuse_address = true });
     const listen_port = server.listen_address.in.getPort();
 
-    std.debug.print("Zig sidecar listening on http://127.0.0.1:{d}\n", .{listen_port});
+    std.debug.print("Zig sidecar listening on http://{s}:{d}\n", .{ listen_host, listen_port });
 
     while (true) {
         const conn = try server.accept();
@@ -1563,6 +1567,10 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     }
 
     // GET /api/scan?top_n=N  (must check specific routes first)
+    if (std.mem.startsWith(u8, uri, "/api/scan/accuracy")) {
+        try handle_scan_accuracy(allocator, stream, uri, active_db);
+        return;
+    }
     if (std.mem.startsWith(u8, uri, "/api/scan/periods/")) {
         const stripped = http.stripQuery(uri);
         const rest = stripped["/api/scan/periods/".len..];
@@ -3534,6 +3542,12 @@ fn handle_futures(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []c
 // ============================================================
 // Market scan
 // ============================================================
+const SCAN_PERIOD_APPEARANCE_WEIGHT: u8 = 30;
+const SCAN_PERIOD_RANK_WEIGHT: u8 = 25;
+const SCAN_PERIOD_DAILY_SCORE_WEIGHT: u8 = 20;
+const SCAN_PERIOD_RETURN_WEIGHT: u8 = 15;
+const SCAN_PERIOD_SCORE_DELTA_WEIGHT: u8 = 10;
+
 const ScoredStock = struct {
     symbol: []const u8,
     name: []const u8,
@@ -4049,11 +4063,11 @@ fn rebuildScanPeriodSnapshot(
         \\ranked AS (
         \\    SELECT
         \\        *,
-        \\        30.0 * CAST(appearances AS DOUBLE) / NULLIF(CAST(scan_days AS DOUBLE), 0.0)
-        \\        + 25.0 * rank_score / 100.0
-        \\        + 20.0 * avg_daily_score / 100.0
-        \\        + 15.0 * LEAST(100.0, GREATEST(0.0, (return_pct + 10.0) / 30.0 * 100.0)) / 100.0
-        \\        + 10.0 * LEAST(100.0, GREATEST(0.0, (score_delta + 20.0) / 40.0 * 100.0)) / 100.0 AS period_score
+        \\        {d}.0 * CAST(appearances AS DOUBLE) / NULLIF(CAST(scan_days AS DOUBLE), 0.0)
+        \\        + {d}.0 * rank_score / 100.0
+        \\        + {d}.0 * avg_daily_score / 100.0
+        \\        + {d}.0 * LEAST(100.0, GREATEST(0.0, (return_pct + 10.0) / 30.0 * 100.0)) / 100.0
+        \\        + {d}.0 * LEAST(100.0, GREATEST(0.0, (score_delta + 20.0) / 40.0 * 100.0)) / 100.0 AS period_score
         \\    FROM scored
         \\    WHERE scan_days > 0
         \\)
@@ -4080,7 +4094,18 @@ fn rebuildScanPeriodSnapshot(
         \\FROM ranked
         \\ORDER BY period_score DESC, appearances DESC, return_pct DESC, latest_score DESC, symbol ASC
         \\LIMIT {d}
-    , .{ period_start, period_end_expr, period, period_start, top_n });
+    , .{
+        period_start,
+        period_end_expr,
+        SCAN_PERIOD_APPEARANCE_WEIGHT,
+        SCAN_PERIOD_RANK_WEIGHT,
+        SCAN_PERIOD_DAILY_SCORE_WEIGHT,
+        SCAN_PERIOD_RETURN_WEIGHT,
+        SCAN_PERIOD_SCORE_DELTA_WEIGHT,
+        period,
+        period_start,
+        top_n,
+    });
     try d.exec(insert_stocks);
 }
 
@@ -4614,6 +4639,618 @@ fn handle_scan_period_detail(
     }
 }
 
+fn latestDailyKDate(allocator: std.mem.Allocator, d: *duckdb.Db) ![]const u8 {
+    return querySingleString(
+        allocator,
+        d,
+        "SELECT CAST(COALESCE(MAX(date), NULL) AS VARCHAR) AS latest_date FROM daily_k",
+        "",
+    );
+}
+
+fn resolveScanAccuracyAsOf(allocator: std.mem.Allocator, d: *duckdb.Db, raw_as_of: ?[]const u8) ![]const u8 {
+    if (raw_as_of) |value| {
+        if (value.len > 0) {
+            if (!isSafeDate(value)) return error.InvalidDate;
+            return allocator.dupe(u8, value);
+        }
+    }
+
+    const latest = try latestDailyKDate(allocator, d);
+    if (latest.len == 0) {
+        allocator.free(latest);
+        return error.NoPriceData;
+    }
+    return latest;
+}
+
+fn resolveScanAccuracyPeriodStart(allocator: std.mem.Allocator, d: *duckdb.Db, raw_period_start: ?[]const u8, as_of: []const u8) ![]const u8 {
+    if (raw_period_start) |value| {
+        if (value.len > 0) {
+            if (!isSafeDate(value)) return error.InvalidDate;
+            return allocator.dupe(u8, value);
+        }
+    }
+    if (!isSafeDate(as_of)) return error.InvalidDate;
+
+    const query = try std.fmt.allocPrint(
+        allocator,
+        "SELECT CAST(CAST(CAST(date_trunc('week', DATE '{s}') AS DATE) - INTERVAL 7 DAY AS DATE) AS VARCHAR) AS period_start",
+        .{as_of},
+    );
+    defer allocator.free(query);
+    return querySingleString(allocator, d, query, "");
+}
+
+fn buildScanAccuracyQuery(
+    allocator: std.mem.Allocator,
+    period_start: []const u8,
+    as_of: []const u8,
+    top_n: usize,
+    bucket_count: usize,
+    select_sql: []const u8,
+) ![]u8 {
+    if (!isSafeDate(period_start) or !isSafeDate(as_of)) return error.InvalidDate;
+    return std.fmt.allocPrint(
+        allocator,
+        \\WITH params AS (
+        \\    SELECT
+        \\        'week' AS period,
+        \\        DATE '{s}' AS period_start,
+        \\        DATE '{s}' AS as_of,
+        \\        {d} AS top_n,
+        \\        {d} AS bucket_count
+        \\),
+        \\period_summary AS (
+        \\    SELECT
+        \\        r.period,
+        \\        r.period_start,
+        \\        r.period_end,
+        \\        r.top_n AS snapshot_top_n,
+        \\        r.candidate_count,
+        \\        r.scan_days,
+        \\        r.data_start,
+        \\        r.data_end
+        \\    FROM scan_period_result r
+        \\    JOIN params p ON r.period = p.period AND r.period_start = p.period_start
+        \\),
+        \\base AS (
+        \\    SELECT
+        \\        s.*,
+        \\        ps.period_end,
+        \\        ps.snapshot_top_n,
+        \\        ps.candidate_count,
+        \\        ps.scan_days,
+        \\        ps.data_start,
+        \\        ps.data_end,
+        \\        p.as_of,
+        \\        p.top_n AS eval_top_n,
+        \\        p.bucket_count,
+        \\        LEAST(100.0, GREATEST(0.0, CAST(s.appearances AS DOUBLE) / NULLIF(CAST(ps.scan_days AS DOUBLE), 0.0) * 100.0)) AS appearance_score,
+        \\        LEAST(100.0, GREATEST(0.0, (CAST(COALESCE(ps.snapshot_top_n, 100) AS DOUBLE) + 1.0 - COALESCE(s.avg_rank, CAST(COALESCE(ps.snapshot_top_n, 100) AS DOUBLE))) * 100.0 / NULLIF(CAST(COALESCE(ps.snapshot_top_n, 100) AS DOUBLE), 0.0))) AS rank_quality_score,
+        \\        LEAST(100.0, GREATEST(0.0, COALESCE(s.avg_daily_score, 0.0))) AS daily_score,
+        \\        LEAST(100.0, GREATEST(0.0, (COALESCE(s.return_pct, 0.0) + 10.0) / 30.0 * 100.0)) AS in_period_return_score,
+        \\        LEAST(100.0, GREATEST(0.0, (COALESCE(s.score_delta, 0.0) + 20.0) / 40.0 * 100.0)) AS score_delta_score
+        \\    FROM scan_period_stock s
+        \\    JOIN period_summary ps ON ps.period = s.period AND ps.period_start = s.period_start
+        \\    JOIN params p ON TRUE
+        \\),
+        \\priced AS (
+        \\    SELECT
+        \\        b.*,
+        \\        entry_k.close AS entry_price,
+        \\        eval_k.close AS eval_price,
+        \\        CASE
+        \\            WHEN entry_k.close IS NULL OR entry_k.close = 0 OR eval_k.close IS NULL THEN NULL
+        \\            ELSE (eval_k.close - entry_k.close) / entry_k.close * 100.0
+        \\        END AS validation_return_pct
+        \\    FROM base b
+        \\    LEFT JOIN daily_k entry_k ON entry_k.symbol = b.symbol AND entry_k.date = b.data_end
+        \\    LEFT JOIN daily_k eval_k ON eval_k.symbol = b.symbol AND eval_k.date = b.as_of
+        \\),
+        \\valid AS (
+        \\    SELECT *
+        \\    FROM priced
+        \\    WHERE validation_return_pct IS NOT NULL
+        \\),
+        \\ranked AS (
+        \\    SELECT
+        \\        *,
+        \\        RANK() OVER (ORDER BY validation_return_pct DESC, symbol ASC) AS actual_rank,
+        \\        COUNT(*) OVER () AS evaluated_count
+        \\    FROM valid
+        \\)
+        \\{s}
+    , .{ period_start, as_of, top_n, bucket_count, select_sql });
+}
+
+fn buildScanAccuracySummaryQuery(allocator: std.mem.Allocator, period_start: []const u8, as_of: []const u8, top_n: usize, bucket_count: usize) ![]u8 {
+    return buildScanAccuracyQuery(
+        allocator,
+        period_start,
+        as_of,
+        top_n,
+        bucket_count,
+        \\SELECT
+        \\    p.period,
+        \\    CAST(p.period_start AS VARCHAR) AS period_start,
+        \\    CAST(ps.period_end AS VARCHAR) AS period_end,
+        \\    CAST(ps.data_start AS VARCHAR) AS data_start,
+        \\    CAST(ps.data_end AS VARCHAR) AS entry_date,
+        \\    CAST(p.as_of AS VARCHAR) AS as_of,
+        \\    p.top_n,
+        \\    p.bucket_count,
+        \\    COALESCE(ps.candidate_count, 0) AS candidate_count,
+        \\    COALESCE(ps.snapshot_top_n, 0) AS snapshot_top_n,
+        \\    CAST(ps.scan_days AS VARCHAR) AS scan_days,
+        \\    (SELECT COUNT(*) FROM priced) AS ranked_count,
+        \\    (SELECT COUNT(*) FROM valid) AS evaluated_count,
+        \\    (SELECT COUNT(*) FROM priced WHERE validation_return_pct IS NULL) AS missing_count
+        \\FROM params p
+        \\LEFT JOIN period_summary ps ON TRUE
+    );
+}
+
+fn buildScanAccuracyMetricsQuery(allocator: std.mem.Allocator, period_start: []const u8, as_of: []const u8, top_n: usize, bucket_count: usize) ![]u8 {
+    return buildScanAccuracyQuery(
+        allocator,
+        period_start,
+        as_of,
+        top_n,
+        bucket_count,
+        \\,
+        \\stats AS (
+        \\    SELECT
+        \\        COUNT(*) AS evaluated_count,
+        \\        AVG(validation_return_pct) AS avg_return_pct,
+        \\        MEDIAN(validation_return_pct) AS median_return_pct,
+        \\        CORR(CAST(evaluated_count + 1 - rank AS DOUBLE), CAST(evaluated_count + 1 - actual_rank AS DOUBLE)) AS rank_ic,
+        \\        CORR(period_score, validation_return_pct) AS score_ic
+        \\    FROM ranked
+        \\),
+        \\top_stats AS (
+        \\    SELECT
+        \\        AVG(CASE WHEN r.rank <= p.top_n THEN r.validation_return_pct ELSE NULL END) AS top_return_pct,
+        \\        AVG(CASE WHEN r.rank <= p.top_n AND r.validation_return_pct > 0 THEN 1.0 WHEN r.rank <= p.top_n THEN 0.0 ELSE NULL END) AS top_positive_rate,
+        \\        AVG(CASE WHEN r.rank <= p.top_n AND r.validation_return_pct > s.avg_return_pct THEN 1.0 WHEN r.rank <= p.top_n THEN 0.0 ELSE NULL END) AS top_outperform_rate
+        \\    FROM ranked r
+        \\    JOIN params p ON TRUE
+        \\    JOIN stats s ON TRUE
+        \\),
+        \\bucket_base AS (
+        \\    SELECT
+        \\        LEAST(p.bucket_count, GREATEST(1, CAST(CEIL(CAST(r.rank AS DOUBLE) * CAST(p.bucket_count AS DOUBLE) / NULLIF(CAST(r.evaluated_count AS DOUBLE), 0.0)) AS INTEGER))) AS bucket,
+        \\        r.validation_return_pct
+        \\    FROM ranked r
+        \\    JOIN params p ON TRUE
+        \\),
+        \\buckets AS (
+        \\    SELECT bucket, AVG(validation_return_pct) AS avg_return_pct
+        \\    FROM bucket_base
+        \\    GROUP BY bucket
+        \\),
+        \\bucket_pairs AS (
+        \\    SELECT b.bucket, b.avg_return_pct, next_b.avg_return_pct AS next_avg_return_pct
+        \\    FROM buckets b
+        \\    JOIN buckets next_b ON next_b.bucket = b.bucket + 1
+        \\),
+        \\monotonicity AS (
+        \\    SELECT
+        \\        CASE
+        \\            WHEN (SELECT COUNT(*) FROM buckets) = 0 THEN 0.0
+        \\            WHEN COUNT(*) = 0 THEN 100.0
+        \\            ELSE AVG(CASE WHEN avg_return_pct >= next_avg_return_pct THEN 1.0 ELSE 0.0 END) * 100.0
+        \\        END AS monotonicity_score
+        \\    FROM bucket_pairs
+        \\),
+        \\score_parts AS (
+        \\    SELECT
+        \\        s.evaluated_count,
+        \\        s.avg_return_pct,
+        \\        s.median_return_pct,
+        \\        s.rank_ic,
+        \\        s.score_ic,
+        \\        t.top_return_pct,
+        \\        t.top_return_pct - s.avg_return_pct AS top_excess_return_pct,
+        \\        t.top_positive_rate,
+        \\        t.top_outperform_rate,
+        \\        m.monotonicity_score,
+        \\        CASE
+        \\            WHEN s.rank_ic IS NOT NULL AND isfinite(s.rank_ic) THEN LEAST(100.0, GREATEST(0.0, (s.rank_ic + 1.0) * 50.0))
+        \\            ELSE 50.0
+        \\        END AS rank_ic_score,
+        \\        LEAST(100.0, GREATEST(0.0, (COALESCE(t.top_return_pct - s.avg_return_pct, 0.0) + 10.0) / 20.0 * 100.0)) AS top_excess_score,
+        \\        COALESCE(t.top_positive_rate, 0.0) * 100.0 AS top_positive_score
+        \\    FROM stats s
+        \\    JOIN top_stats t ON TRUE
+        \\    JOIN monotonicity m ON TRUE
+        \\)
+        \\SELECT
+        \\    evaluated_count,
+        \\    accuracy_score,
+        \\    CASE WHEN rank_ic IS NOT NULL AND isfinite(rank_ic) THEN CAST(rank_ic AS VARCHAR) ELSE NULL END AS rank_ic,
+        \\    CASE WHEN score_ic IS NOT NULL AND isfinite(score_ic) THEN CAST(score_ic AS VARCHAR) ELSE NULL END AS score_ic,
+        \\    CAST(avg_return_pct AS VARCHAR) AS avg_return_pct,
+        \\    CAST(median_return_pct AS VARCHAR) AS median_return_pct,
+        \\    CAST(top_return_pct AS VARCHAR) AS top_return_pct,
+        \\    CAST(top_excess_return_pct AS VARCHAR) AS top_excess_return_pct,
+        \\    CAST(top_positive_rate AS VARCHAR) AS top_positive_rate,
+        \\    CAST(top_outperform_rate AS VARCHAR) AS top_outperform_rate,
+        \\    CAST(monotonicity_score AS VARCHAR) AS monotonicity_score
+        \\FROM (
+        \\    SELECT
+        \\        *,
+        \\        0.40 * rank_ic_score
+        \\        + 0.30 * top_excess_score
+        \\        + 0.20 * top_positive_score
+        \\        + 0.10 * COALESCE(monotonicity_score, 0.0) AS accuracy_score
+        \\    FROM score_parts
+        \\)
+    );
+}
+
+fn buildScanAccuracyBucketsQuery(allocator: std.mem.Allocator, period_start: []const u8, as_of: []const u8, top_n: usize, bucket_count: usize) ![]u8 {
+    return buildScanAccuracyQuery(
+        allocator,
+        period_start,
+        as_of,
+        top_n,
+        bucket_count,
+        \\,
+        \\bucket_base AS (
+        \\    SELECT
+        \\        LEAST(p.bucket_count, GREATEST(1, CAST(CEIL(CAST(r.rank AS DOUBLE) * CAST(p.bucket_count AS DOUBLE) / NULLIF(CAST(r.evaluated_count AS DOUBLE), 0.0)) AS INTEGER))) AS bucket,
+        \\        r.rank,
+        \\        r.validation_return_pct
+        \\    FROM ranked r
+        \\    JOIN params p ON TRUE
+        \\)
+        \\SELECT
+        \\    bucket,
+        \\    MIN(rank) AS rank_start,
+        \\    MAX(rank) AS rank_end,
+        \\    COUNT(*) AS sample_count,
+        \\    CAST(AVG(validation_return_pct) AS VARCHAR) AS avg_return_pct,
+        \\    CAST(AVG(CASE WHEN validation_return_pct > 0 THEN 1.0 ELSE 0.0 END) AS VARCHAR) AS positive_rate
+        \\FROM bucket_base
+        \\GROUP BY bucket
+        \\ORDER BY bucket
+    );
+}
+
+fn buildScanAccuracyComponentsQuery(allocator: std.mem.Allocator, period_start: []const u8, as_of: []const u8, top_n: usize, bucket_count: usize) ![]u8 {
+    const select_sql = try std.fmt.allocPrint(
+        allocator,
+        \\,
+        \\component_values AS (
+        \\    SELECT 1 AS sort_order, 'appearance' AS key, '上榜率' AS label, {d} AS weight, appearance_score AS component_score, validation_return_pct FROM valid
+        \\    UNION ALL
+        \\    SELECT 2 AS sort_order, 'rank_quality' AS key, '排名质量' AS label, {d} AS weight, rank_quality_score AS component_score, validation_return_pct FROM valid
+        \\    UNION ALL
+        \\    SELECT 3 AS sort_order, 'avg_daily_score' AS key, '日均评分' AS label, {d} AS weight, daily_score AS component_score, validation_return_pct FROM valid
+        \\    UNION ALL
+        \\    SELECT 4 AS sort_order, 'in_period_return' AS key, '周内收益' AS label, {d} AS weight, in_period_return_score AS component_score, validation_return_pct FROM valid
+        \\    UNION ALL
+        \\    SELECT 5 AS sort_order, 'score_delta' AS key, '评分变化' AS label, {d} AS weight, score_delta_score AS component_score, validation_return_pct FROM valid
+        \\),
+        \\component_stats AS (
+        \\    SELECT
+        \\        sort_order,
+        \\        key,
+        \\        label,
+        \\        weight,
+        \\        COUNT(*) AS sample_count,
+        \\        AVG(component_score) AS avg_score,
+        \\        CASE
+        \\            WHEN COUNT(*) > 1 AND COUNT(DISTINCT component_score) > 1 AND isfinite(CORR(component_score, validation_return_pct)) THEN CORR(component_score, validation_return_pct)
+        \\            ELSE NULL
+        \\        END AS correlation
+        \\    FROM component_values
+        \\    GROUP BY sort_order, key, label, weight
+        \\)
+        \\SELECT
+        \\    key,
+        \\    label,
+        \\    weight,
+        \\    sample_count,
+        \\    CAST(avg_score AS VARCHAR) AS avg_score,
+        \\    CASE WHEN correlation IS NOT NULL AND isfinite(correlation) THEN CAST(correlation AS VARCHAR) ELSE NULL END AS correlation,
+        \\    CASE
+        \\        WHEN sample_count < 30 THEN '样本不足，仅观察'
+        \\        WHEN correlation > 0.10 THEN '考虑加权'
+        \\        WHEN correlation < -0.10 THEN '考虑降权'
+        \\        ELSE '保持观察'
+        \\    END AS suggestion
+        \\FROM component_stats
+        \\ORDER BY sort_order
+    , .{
+        SCAN_PERIOD_APPEARANCE_WEIGHT,
+        SCAN_PERIOD_RANK_WEIGHT,
+        SCAN_PERIOD_DAILY_SCORE_WEIGHT,
+        SCAN_PERIOD_RETURN_WEIGHT,
+        SCAN_PERIOD_SCORE_DELTA_WEIGHT,
+    });
+    defer allocator.free(select_sql);
+
+    return buildScanAccuracyQuery(
+        allocator,
+        period_start,
+        as_of,
+        top_n,
+        bucket_count,
+        select_sql,
+    );
+}
+
+fn buildScanAccuracyStocksQuery(allocator: std.mem.Allocator, period_start: []const u8, as_of: []const u8, top_n: usize, bucket_count: usize) ![]u8 {
+    return buildScanAccuracyQuery(
+        allocator,
+        period_start,
+        as_of,
+        top_n,
+        bucket_count,
+        \\SELECT
+        \\    p.rank,
+        \\    p.symbol,
+        \\    p.name,
+        \\    p.industry,
+        \\    p.period_score,
+        \\    p.appearances,
+        \\    p.avg_rank,
+        \\    p.avg_daily_score,
+        \\    p.score_delta,
+        \\    p.return_pct AS in_period_return_pct,
+        \\    CAST(p.entry_price AS VARCHAR) AS entry_price,
+        \\    CAST(p.eval_price AS VARCHAR) AS eval_price,
+        \\    CAST(p.validation_return_pct AS VARCHAR) AS validation_return_pct,
+        \\    CAST(r.actual_rank AS VARCHAR) AS actual_rank,
+        \\    CAST(r.actual_rank - p.rank AS VARCHAR) AS rank_delta
+        \\FROM priced p
+        \\LEFT JOIN ranked r ON r.symbol = p.symbol
+        \\ORDER BY p.rank
+    );
+}
+
+fn handle_scan_accuracy(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
+    const d = db orelse {
+        try http.respondError(allocator, stream, 500, "database unavailable");
+        return;
+    };
+    const period = http.queryParam(uri, "period") orelse "week";
+    if (!std.mem.eql(u8, period, "week")) {
+        try http.respondError(allocator, stream, 400, "only weekly accuracy is supported");
+        return;
+    }
+
+    const top_n = parsePositiveQueryInt(uri, "top_n", 20, 100);
+    const bucket_count = parsePositiveQueryInt(uri, "bucket_count", 5, 10);
+
+    const as_of = resolveScanAccuracyAsOf(allocator, d, http.queryParam(uri, "as_of")) catch |err| switch (err) {
+        error.InvalidDate => {
+            try http.respondError(allocator, stream, 400, "invalid as_of date");
+            return;
+        },
+        error.NoPriceData => {
+            try http.respondError(allocator, stream, 404, "no daily price data");
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(as_of);
+
+    const period_start = resolveScanAccuracyPeriodStart(allocator, d, http.queryParam(uri, "period_start"), as_of) catch |err| switch (err) {
+        error.InvalidDate => {
+            try http.respondError(allocator, stream, 400, "invalid period_start date");
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(period_start);
+
+    const summary_query = try buildScanAccuracySummaryQuery(allocator, period_start, as_of, top_n, bucket_count);
+    defer allocator.free(summary_query);
+    var summary = d.queryRows(allocator, summary_query) catch |err| {
+        std.debug.print("DuckDB scan accuracy summary error: {any}\n", .{err});
+        try http.respondError(allocator, stream, 500, "scan accuracy summary failed");
+        return;
+    };
+    defer summary.deinit(allocator);
+
+    if (summary.rows.items.len == 0 or summary.getF64(0, "scan_days") == null) {
+        try http.respondError(allocator, stream, 404, "weekly scan period not found");
+        return;
+    }
+    if ((summary.getF64(0, "evaluated_count") orelse 0) <= 0) {
+        try http.respondError(allocator, stream, 404, "no evaluable price data for weekly scan period");
+        return;
+    }
+
+    const metrics_query = try buildScanAccuracyMetricsQuery(allocator, period_start, as_of, top_n, bucket_count);
+    defer allocator.free(metrics_query);
+    var metrics = d.queryRows(allocator, metrics_query) catch |err| {
+        std.debug.print("DuckDB scan accuracy metrics error: {any}\n", .{err});
+        try http.respondError(allocator, stream, 500, "scan accuracy metrics failed");
+        return;
+    };
+    defer metrics.deinit(allocator);
+
+    const buckets_query = try buildScanAccuracyBucketsQuery(allocator, period_start, as_of, top_n, bucket_count);
+    defer allocator.free(buckets_query);
+    var buckets = d.queryRows(allocator, buckets_query) catch |err| {
+        std.debug.print("DuckDB scan accuracy buckets error: {any}\n", .{err});
+        try http.respondError(allocator, stream, 500, "scan accuracy buckets failed");
+        return;
+    };
+    defer buckets.deinit(allocator);
+
+    const components_query = try buildScanAccuracyComponentsQuery(allocator, period_start, as_of, top_n, bucket_count);
+    defer allocator.free(components_query);
+    var components = d.queryRows(allocator, components_query) catch |err| {
+        std.debug.print("DuckDB scan accuracy components error: {any}\n", .{err});
+        try http.respondError(allocator, stream, 500, "scan accuracy components failed");
+        return;
+    };
+    defer components.deinit(allocator);
+
+    const stocks_query = try buildScanAccuracyStocksQuery(allocator, period_start, as_of, top_n, bucket_count);
+    defer allocator.free(stocks_query);
+    var stocks = d.queryRows(allocator, stocks_query) catch |err| {
+        std.debug.print("DuckDB scan accuracy stocks error: {any}\n", .{err});
+        try http.respondError(allocator, stream, 500, "scan accuracy stocks failed");
+        return;
+    };
+    defer stocks.deinit(allocator);
+
+    var out = std.io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+
+    try s.beginObject();
+    try s.objectField("summary");
+    try s.beginObject();
+    try s.objectField("period");
+    try s.write(summary.getStr(0, "period") orelse "week");
+    try s.objectField("period_start");
+    try s.write(summary.getStr(0, "period_start") orelse period_start);
+    try s.objectField("period_end");
+    try s.write(summary.getStr(0, "period_end") orelse "");
+    try s.objectField("data_start");
+    try s.write(summary.getStr(0, "data_start") orelse "");
+    try s.objectField("entry_date");
+    try s.write(summary.getStr(0, "entry_date") orelse "");
+    try s.objectField("as_of");
+    try s.write(summary.getStr(0, "as_of") orelse as_of);
+    try s.objectField("price_source");
+    try s.write("daily_k_close");
+    try s.objectField("top_n");
+    try s.write(summary.getF64(0, "top_n") orelse @as(f64, @floatFromInt(top_n)));
+    try s.objectField("bucket_count");
+    try s.write(summary.getF64(0, "bucket_count") orelse @as(f64, @floatFromInt(bucket_count)));
+    try s.objectField("candidate_count");
+    try s.write(summary.getF64(0, "candidate_count") orelse 0);
+    try s.objectField("ranked_count");
+    try s.write(summary.getF64(0, "ranked_count") orelse 0);
+    try s.objectField("evaluated_count");
+    try s.write(summary.getF64(0, "evaluated_count") orelse 0);
+    try s.objectField("missing_count");
+    try s.write(summary.getF64(0, "missing_count") orelse 0);
+    try s.objectField("scan_days");
+    try s.write(summary.getF64(0, "scan_days") orelse 0);
+    try s.endObject();
+
+    try s.objectField("metrics");
+    try s.beginObject();
+    if (metrics.rows.items.len > 0) {
+        try s.objectField("accuracy_score");
+        try s.write(metrics.getF64(0, "accuracy_score") orelse 0);
+        try s.objectField("rank_ic");
+        try writeNullableF64(&s, metrics.getF64(0, "rank_ic"));
+        try s.objectField("score_ic");
+        try writeNullableF64(&s, metrics.getF64(0, "score_ic"));
+        try s.objectField("avg_return_pct");
+        try writeNullableF64(&s, metrics.getF64(0, "avg_return_pct"));
+        try s.objectField("median_return_pct");
+        try writeNullableF64(&s, metrics.getF64(0, "median_return_pct"));
+        try s.objectField("top_return_pct");
+        try writeNullableF64(&s, metrics.getF64(0, "top_return_pct"));
+        try s.objectField("top_excess_return_pct");
+        try writeNullableF64(&s, metrics.getF64(0, "top_excess_return_pct"));
+        try s.objectField("top_positive_rate");
+        try writeNullableF64(&s, metrics.getF64(0, "top_positive_rate"));
+        try s.objectField("top_outperform_rate");
+        try writeNullableF64(&s, metrics.getF64(0, "top_outperform_rate"));
+        try s.objectField("monotonicity_score");
+        try writeNullableF64(&s, metrics.getF64(0, "monotonicity_score"));
+    }
+    try s.endObject();
+
+    try s.objectField("buckets");
+    try s.beginArray();
+    var br: usize = 0;
+    while (br < buckets.rows.items.len) : (br += 1) {
+        try s.beginObject();
+        try s.objectField("bucket");
+        try s.write(buckets.getF64(br, "bucket") orelse 0);
+        try s.objectField("rank_start");
+        try s.write(buckets.getF64(br, "rank_start") orelse 0);
+        try s.objectField("rank_end");
+        try s.write(buckets.getF64(br, "rank_end") orelse 0);
+        try s.objectField("sample_count");
+        try s.write(buckets.getF64(br, "sample_count") orelse 0);
+        try s.objectField("avg_return_pct");
+        try writeNullableF64(&s, buckets.getF64(br, "avg_return_pct"));
+        try s.objectField("positive_rate");
+        try writeNullableF64(&s, buckets.getF64(br, "positive_rate"));
+        try s.endObject();
+    }
+    try s.endArray();
+
+    try s.objectField("components");
+    try s.beginArray();
+    var cr: usize = 0;
+    while (cr < components.rows.items.len) : (cr += 1) {
+        try s.beginObject();
+        try s.objectField("key");
+        try s.write(components.getStr(cr, "key") orelse "");
+        try s.objectField("label");
+        try s.write(components.getStr(cr, "label") orelse "");
+        try s.objectField("weight");
+        try s.write(components.getF64(cr, "weight") orelse 0);
+        try s.objectField("sample_count");
+        try s.write(components.getF64(cr, "sample_count") orelse 0);
+        try s.objectField("avg_score");
+        try writeNullableF64(&s, components.getF64(cr, "avg_score"));
+        try s.objectField("correlation");
+        try writeNullableF64(&s, components.getF64(cr, "correlation"));
+        try s.objectField("suggestion");
+        try s.write(components.getStr(cr, "suggestion") orelse "");
+        try s.endObject();
+    }
+    try s.endArray();
+
+    try s.objectField("stocks");
+    try s.beginArray();
+    var sr: usize = 0;
+    while (sr < stocks.rows.items.len) : (sr += 1) {
+        try s.beginObject();
+        try s.objectField("rank");
+        try s.write(stocks.getF64(sr, "rank") orelse 0);
+        try s.objectField("symbol");
+        try s.write(stocks.getStr(sr, "symbol") orelse "");
+        try s.objectField("name");
+        try s.write(stocks.getStr(sr, "name") orelse "");
+        try s.objectField("industry");
+        try s.write(stocks.getStr(sr, "industry") orelse "");
+        try s.objectField("period_score");
+        try s.write(stocks.getF64(sr, "period_score") orelse 0);
+        try s.objectField("appearances");
+        try s.write(stocks.getF64(sr, "appearances") orelse 0);
+        try s.objectField("avg_rank");
+        try s.write(stocks.getF64(sr, "avg_rank") orelse 0);
+        try s.objectField("avg_daily_score");
+        try s.write(stocks.getF64(sr, "avg_daily_score") orelse 0);
+        try s.objectField("score_delta");
+        try s.write(stocks.getF64(sr, "score_delta") orelse 0);
+        try s.objectField("in_period_return_pct");
+        try writeNullableF64(&s, stocks.getF64(sr, "in_period_return_pct"));
+        try s.objectField("entry_price");
+        try writeNullableF64(&s, stocks.getF64(sr, "entry_price"));
+        try s.objectField("eval_price");
+        try writeNullableF64(&s, stocks.getF64(sr, "eval_price"));
+        try s.objectField("validation_return_pct");
+        try writeNullableF64(&s, stocks.getF64(sr, "validation_return_pct"));
+        try s.objectField("actual_rank");
+        try writeNullableF64(&s, stocks.getF64(sr, "actual_rank"));
+        try s.objectField("rank_delta");
+        try writeNullableF64(&s, stocks.getF64(sr, "rank_delta"));
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+
+    try http.respond(stream, 200, out.written());
+}
+
 fn handle_scan_period_rebuild(allocator: std.mem.Allocator, stream: std.net.Stream, uri: []const u8, db: ?*duckdb.Db) !void {
     const period = http.queryParam(uri, "period") orelse "all";
     if (!std.mem.eql(u8, period, "all") and !isSafeScanPeriod(period)) {
@@ -4787,6 +5424,127 @@ test "scan history detail query bounds rows by recorded daily total" {
     try std.testing.expectEqual(@as(usize, 3), rows.rows.items.len);
     try std.testing.expectEqualStrings("000001", rows.getStr(0, "symbol").?);
     try std.testing.expectEqualStrings("000003", rows.getStr(2, "symbol").?);
+}
+
+test "weekly scan accuracy defaults to previous full week and computes metrics" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/akshare_scan_accuracy_test.db";
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
+
+    var db = try duckdb.Db.open(allocator, db_path);
+    defer db.close();
+    try initSchema(&db);
+
+    try db.exec(
+        \\INSERT INTO daily_k (symbol, date, open, close, high, low, volume, amount, change_pct) VALUES
+        \\('000001', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000002', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000003', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000004', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000001', '2026-05-10', 13, 13, 13, 13, 100, 1000, 30),
+        \\('000002', '2026-05-10', 11, 11, 11, 11, 100, 1000, 10),
+        \\('000003', '2026-05-10', 9, 9, 9, 9, 100, 1000, -10)
+    );
+    try db.exec(
+        \\INSERT INTO scan_period_result (
+        \\    period, period_start, period_end, top_n, candidate_count, scan_days, data_start, data_end, is_current
+        \\) VALUES (
+        \\    'week', '2026-04-27', '2026-05-03', 4, 4, 5, '2026-04-27', '2026-05-01', false
+        \\)
+    );
+    try db.exec(
+        \\INSERT INTO scan_period_stock (
+        \\    period, period_start, rank, symbol, name, industry, period_score,
+        \\    appearances, best_rank, avg_rank, avg_daily_score, score_delta, return_pct
+        \\) VALUES
+        \\('week', '2026-04-27', 1, '000001', 'Alpha', 'Tech', 90, 5, 1, 1, 90, 5, 8),
+        \\('week', '2026-04-27', 2, '000002', 'Beta', 'Tech', 80, 4, 2, 2, 80, 2, 3),
+        \\('week', '2026-04-27', 3, '000003', 'Gamma', 'Tech', 70, 3, 3, 3, 70, -1, -2),
+        \\('week', '2026-04-27', 4, '000004', 'Delta', 'Tech', 60, 2, 4, 4, 60, -4, -5)
+    );
+
+    const as_of = try resolveScanAccuracyAsOf(allocator, &db, null);
+    defer allocator.free(as_of);
+    try std.testing.expectEqualStrings("2026-05-10", as_of);
+
+    const period_start = try resolveScanAccuracyPeriodStart(allocator, &db, null, as_of);
+    defer allocator.free(period_start);
+    try std.testing.expectEqualStrings("2026-04-27", period_start);
+
+    const summary_query = try buildScanAccuracySummaryQuery(allocator, period_start, as_of, 2, 3);
+    defer allocator.free(summary_query);
+    var summary = try db.queryRows(allocator, summary_query);
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(@as(f64, 4), summary.getF64(0, "ranked_count").?);
+    try std.testing.expectEqual(@as(f64, 3), summary.getF64(0, "evaluated_count").?);
+    try std.testing.expectEqual(@as(f64, 1), summary.getF64(0, "missing_count").?);
+    try std.testing.expectEqual(@as(f64, 5), summary.getF64(0, "scan_days").?);
+
+    const metrics_query = try buildScanAccuracyMetricsQuery(allocator, period_start, as_of, 2, 3);
+    defer allocator.free(metrics_query);
+    var metrics = try db.queryRows(allocator, metrics_query);
+    defer metrics.deinit(allocator);
+    try std.testing.expect(metrics.getF64(0, "rank_ic").? > 0.99);
+    try std.testing.expect(@abs(metrics.getF64(0, "avg_return_pct").? - 10.0) < 0.001);
+    try std.testing.expect(@abs(metrics.getF64(0, "top_return_pct").? - 20.0) < 0.001);
+    try std.testing.expect(@abs(metrics.getF64(0, "top_excess_return_pct").? - 10.0) < 0.001);
+    try std.testing.expect(@abs(metrics.getF64(0, "top_positive_rate").? - 1.0) < 0.001);
+    try std.testing.expect(@abs(metrics.getF64(0, "top_outperform_rate").? - 0.5) < 0.001);
+    try std.testing.expect(@abs(metrics.getF64(0, "monotonicity_score").? - 100.0) < 0.001);
+
+    const stocks_query = try buildScanAccuracyStocksQuery(allocator, period_start, as_of, 2, 3);
+    defer allocator.free(stocks_query);
+    var stocks = try db.queryRows(allocator, stocks_query);
+    defer stocks.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), stocks.rows.items.len);
+    try std.testing.expectEqualStrings("000001", stocks.getStr(0, "symbol").?);
+    try std.testing.expect(@abs(stocks.getF64(0, "validation_return_pct").? - 30.0) < 0.001);
+    try std.testing.expect(stocks.getF64(3, "validation_return_pct") == null);
+    try std.testing.expect(stocks.getF64(3, "actual_rank") == null);
+}
+
+test "weekly scan accuracy rank ic is negative when ranking is reversed" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/akshare_scan_accuracy_reverse_test.db";
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
+
+    var db = try duckdb.Db.open(allocator, db_path);
+    defer db.close();
+    try initSchema(&db);
+
+    try db.exec(
+        \\INSERT INTO daily_k (symbol, date, open, close, high, low, volume, amount, change_pct) VALUES
+        \\('000001', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000002', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000003', '2026-05-01', 10, 10, 10, 10, 100, 1000, 0),
+        \\('000001', '2026-05-10', 9, 9, 9, 9, 100, 1000, -10),
+        \\('000002', '2026-05-10', 11, 11, 11, 11, 100, 1000, 10),
+        \\('000003', '2026-05-10', 13, 13, 13, 13, 100, 1000, 30)
+    );
+    try db.exec(
+        \\INSERT INTO scan_period_result (
+        \\    period, period_start, period_end, top_n, candidate_count, scan_days, data_start, data_end, is_current
+        \\) VALUES (
+        \\    'week', '2026-04-27', '2026-05-03', 3, 3, 5, '2026-04-27', '2026-05-01', false
+        \\)
+    );
+    try db.exec(
+        \\INSERT INTO scan_period_stock (
+        \\    period, period_start, rank, symbol, name, industry, period_score,
+        \\    appearances, best_rank, avg_rank, avg_daily_score, score_delta, return_pct
+        \\) VALUES
+        \\('week', '2026-04-27', 1, '000001', 'Alpha', 'Tech', 90, 5, 1, 1, 90, 5, 8),
+        \\('week', '2026-04-27', 2, '000002', 'Beta', 'Tech', 80, 4, 2, 2, 80, 2, 3),
+        \\('week', '2026-04-27', 3, '000003', 'Gamma', 'Tech', 70, 3, 3, 3, 70, -1, -2)
+    );
+
+    const metrics_query = try buildScanAccuracyMetricsQuery(allocator, "2026-04-27", "2026-05-10", 2, 3);
+    defer allocator.free(metrics_query);
+    var metrics = try db.queryRows(allocator, metrics_query);
+    defer metrics.deinit(allocator);
+    try std.testing.expect(metrics.getF64(0, "rank_ic").? < -0.99);
 }
 
 test "backtest request parses custom factor specs" {
