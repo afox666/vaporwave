@@ -63,6 +63,15 @@ const periodRankingTitle = computed(() => {
   if (!detail) return `${periodLabels[activePeriod.value]} RANKING`
   return `${detail.period_start} ~ ${detail.period_end} ${periodLabels[activePeriod.value]}`
 })
+const selectedHistoryItem = computed(() => dates.value.find(d => d.scan_date === selectedDate.value) || null)
+const selectedRankingTitle = computed(() => {
+  const item = selectedHistoryItem.value
+  if (!item) return `${selectedDate.value} RANKING`
+  const dataDate = historyDataDate(item)
+  return dataDate && dataDate !== item.scan_date
+    ? `${item.scan_date} / DATA ${dataDate} RANKING`
+    : `${item.scan_date} RANKING`
+})
 const accuracyStockBySymbol = computed(() => {
   const map = new Map<string, ScanAccuracyStock>()
   for (const stock of accuracy.value?.stocks || []) {
@@ -257,6 +266,10 @@ function periodRange(item: ScanPeriodItem) {
   return `${item.period_start} ~ ${item.period_end}`
 }
 
+function historyDataDate(item: ScanHistoryItem) {
+  return item.data_date || item.scan_date
+}
+
 function accuracyFor(stock: ScanPeriodStock) {
   return accuracyStockBySymbol.value.get(stock.symbol)
 }
@@ -311,16 +324,22 @@ onMounted(() => {
       <template v-else>
         <div class="scan-history-layout">
           <div class="date-list">
-            <CRTFrame title="SCAN DATES">
+            <CRTFrame title="SCAN RUNS">
               <div
                 v-for="d in dates"
                 :key="d.scan_date"
-                class="date-item"
+                class="date-item scan-date-item"
                 :class="{ active: d.scan_date === selectedDate }"
                 @click="selectDate(d.scan_date)"
               >
-                <span class="date-label">{{ d.scan_date }}</span>
-                <span class="date-count">{{ d.total_stocks }} 只</span>
+                <span class="date-main">
+                  <span class="date-label">{{ d.scan_date }}</span>
+                  <span class="date-subline">数据 {{ historyDataDate(d) }}</span>
+                </span>
+                <span class="date-side">
+                  <span class="date-count">{{ d.total_stocks }} 只</span>
+                  <span v-if="d.coverage_count" class="coverage-count">覆盖 {{ d.coverage_count }}</span>
+                </span>
               </div>
             </CRTFrame>
           </div>
@@ -329,6 +348,13 @@ onMounted(() => {
             <div v-if="loadingDetail" class="loading-glitch">LOADING SCAN DATA...</div>
 
             <template v-else-if="stocks.length > 0">
+              <div v-if="selectedHistoryItem" class="scan-meta mb-3">
+                <span>扫描日 {{ selectedHistoryItem.scan_date }}</span>
+                <span>数据日 {{ historyDataDate(selectedHistoryItem) }}</span>
+                <span>榜单 {{ selectedHistoryItem.total_stocks }} 只</span>
+                <span v-if="selectedHistoryItem.coverage_count">覆盖 {{ selectedHistoryItem.coverage_count }} 只</span>
+              </div>
+
               <div v-if="stocks.length >= 3" class="grid-3 mb-3">
                 <div
                   v-for="stock in stocks.slice(0, 3)"
@@ -354,7 +380,7 @@ onMounted(() => {
                 </div>
               </div>
 
-              <CRTFrame :title="`${selectedDate} RANKING`">
+              <CRTFrame :title="selectedRankingTitle">
                 <div class="table-scroll">
                   <table class="vapor-table">
                     <thead>
@@ -684,7 +710,7 @@ onMounted(() => {
 
 .scan-history-layout {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 280px 1fr;
   gap: 1.5rem;
   align-items: start;
 }
@@ -726,6 +752,38 @@ onMounted(() => {
   white-space: nowrap;
 }
 
+.scan-date-item {
+  align-items: flex-start;
+}
+
+.date-main,
+.date-side {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.date-main {
+  flex: 1;
+}
+
+.date-side {
+  align-items: flex-end;
+}
+
+.date-subline,
+.coverage-count {
+  color: #8070b0;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.coverage-count {
+  color: #6050a0;
+}
+
 .current-flag {
   display: inline-block;
   margin-left: 0.4rem;
@@ -733,6 +791,7 @@ onMounted(() => {
   font-size: 0.72rem;
 }
 
+.scan-meta,
 .period-meta {
   display: flex;
   flex-wrap: wrap;
@@ -742,6 +801,7 @@ onMounted(() => {
   font-size: 0.88rem;
 }
 
+.scan-meta span,
 .period-meta span {
   border: 1px solid #bf00ff30;
   padding: 0.35rem 0.55rem;
@@ -852,6 +912,10 @@ onMounted(() => {
 
   .date-list {
     position: static;
+  }
+
+  .date-item {
+    padding: 0.75rem 0.7rem;
   }
 
   .period-actions {

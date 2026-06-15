@@ -213,6 +213,7 @@ pub fn main() !void {
     var scheduler_command: ?[]const u8 = null;
     var sync_years: u16 = 10;
     var sync_limit: usize = 0;
+    var sync_since: ?[]const u8 = null;
     var job_top_n: u16 = 100;
     var scheduler_interval_seconds: u32 = 30;
     var scheduled_for: ?[]const u8 = null;
@@ -242,6 +243,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--limit") and i + 1 < args.len) {
             sync_limit = std.fmt.parseInt(usize, args[i + 1], 10) catch 0;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--since") and i + 1 < args.len) {
+            sync_since = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--top-n") and i + 1 < args.len) {
             job_top_n = std.fmt.parseInt(u16, args[i + 1], 10) catch 100;
             i += 1;
@@ -258,7 +262,7 @@ pub fn main() !void {
         if (db_path) |p| {
             var db = try openDatabase(allocator, p);
             defer db.close();
-            try sync.run(allocator, &db, command, sync_years, sync_limit);
+            try sync.run(allocator, &db, command, sync_years, sync_limit, sync_since);
         } else {
             std.debug.print("同步命令需要指定可打开的 --db <path>\n", .{});
             return error.MissingDatabase;
@@ -596,7 +600,7 @@ fn runJobCommand(
     scheduled_for: ?[]const u8,
 ) ![]const u8 {
     if (std.mem.eql(u8, command, "sync-daily")) {
-        try sync.run(allocator, db, "update", 10, limit);
+        try sync.run(allocator, db, "update", 10, limit, null);
         return std.fmt.allocPrint(allocator, "job=sync-daily limit={d}", .{limit});
     }
 
@@ -616,7 +620,7 @@ fn runJobCommand(
     }
 
     if (std.mem.eql(u8, command, "daily-pipeline")) {
-        try sync.run(allocator, db, "update", 10, limit);
+        try sync.run(allocator, db, "update", 10, limit, null);
 
         var scan = try runMarketScan(allocator, db, top_n);
         defer scan.deinit(allocator);

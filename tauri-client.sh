@@ -696,6 +696,7 @@ usage() {
   ./tauri-client.sh sync stats
   ./tauri-client.sh sync backfill --years 10 --limit 50
   ./tauri-client.sh sync update --limit 200
+  ./tauri-client.sh sync update-since --since 2026-06-01 --limit 200
 
 CLI 示例:
   ./tauri-client.sh scan 50

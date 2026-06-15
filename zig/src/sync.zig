@@ -9,7 +9,7 @@ const UpdateTask = struct {
     last_date: []const u8,
 };
 
-pub fn run(allocator: std.mem.Allocator, db: *duckdb.Db, command: []const u8, years_arg: u16, limit: usize) !void {
+pub fn run(allocator: std.mem.Allocator, db: *duckdb.Db, command: []const u8, years_arg: u16, limit: usize, since_date: ?[]const u8) !void {
     const years = if (years_arg > 0) years_arg else 10;
 
     if (std.mem.eql(u8, command, "names")) {
@@ -22,6 +22,8 @@ pub fn run(allocator: std.mem.Allocator, db: *duckdb.Db, command: []const u8, ye
         try syncBackfill(allocator, db, years, limit);
     } else if (std.mem.eql(u8, command, "update")) {
         try syncIncremental(allocator, db, limit);
+    } else if (std.mem.eql(u8, command, "update-since")) {
+        try syncSince(allocator, db, since_date orelse return error.MissingSinceDate, limit);
     } else if (std.mem.eql(u8, command, "full")) {
         try syncBackfill(allocator, db, years, limit);
     } else {
@@ -30,12 +32,62 @@ pub fn run(allocator: std.mem.Allocator, db: *duckdb.Db, command: []const u8, ye
             \\  --sync names                 仅同步股票名称
             \\  --sync backfill --years 10   回填最近 N 年日K
             \\  --sync update                增量更新
+            \\  --sync update-since --since YYYY-MM-DD
             \\  --sync stats                 数据库统计
             \\  --sync query                 示例查询
             \\
         , .{});
         return error.InvalidSyncCommand;
     }
+}
+
+fn syncSince(allocator: std.mem.Allocator, db: *duckdb.Db, since_date: []const u8, limit: usize) !void {
+    if (!isSafeDate(since_date)) return error.InvalidSinceDate;
+
+    std.debug.print("============================================================\n", .{});
+    std.debug.print("指定日期后同步 - 更新 {s} 之后日K\n", .{since_date});
+    std.debug.print("============================================================\n", .{});
+
+    try ensureStockPool(allocator, db);
+
+    const symbols = try symbolsNeedingSince(allocator, db, since_date);
+    defer freeStringList(allocator, symbols);
+    const days = try fetchDaysSince(allocator, db, since_date);
+
+    const process_count = if (limit > 0) @min(limit, symbols.len) else symbols.len;
+    std.debug.print("需处理 {d} 只股票\n", .{symbols.len});
+    std.debug.print("拉取最近 {d} 天日K\n", .{days});
+    if (limit > 0) {
+        std.debug.print("本次限制处理: {d} 只\n", .{process_count});
+    }
+
+    var total_rows: usize = 0;
+    var success_count: usize = 0;
+    var fail_count: usize = 0;
+
+    for (symbols[0..process_count], 0..) |symbol, idx| {
+        const written = syncSymbolRecent(allocator, db, symbol, days, since_date) catch |err| blk: {
+            std.debug.print("  {s} 指定日期后同步失败: {any}\n", .{ symbol, err });
+            break :blk 0;
+        };
+        if (written > 0) {
+            total_rows += written;
+            success_count += 1;
+        } else {
+            fail_count += 1;
+        }
+
+        if ((idx + 1) % 50 == 0 or idx + 1 == process_count) {
+            std.debug.print("  进度: {d}/{d} | 已写入/更新 {d} 条 | 成功{d} 空数据{d}\n", .{ idx + 1, process_count, total_rows, success_count, fail_count });
+        }
+        if ((idx + 1) % 200 == 0) {
+            std.Thread.sleep(3 * std.time.ns_per_s);
+        } else {
+            std.Thread.sleep(120 * std.time.ns_per_ms);
+        }
+    }
+
+    std.debug.print("\n完成: 共写入/更新 {d} 条数据\n", .{total_rows});
 }
 
 fn syncNames(allocator: std.mem.Allocator, db: *duckdb.Db) !usize {
@@ -222,6 +274,32 @@ fn syncSymbol(allocator: std.mem.Allocator, db: *duckdb.Db, symbol: []const u8, 
     }
 
     return error.FetchDailyKFailed;
+}
+
+fn syncSymbolRecent(allocator: std.mem.Allocator, db: *duckdb.Db, symbol: []const u8, days: u16, start_after: ?[]const u8) !usize {
+    if (!isSafeSymbol(symbol)) return 0;
+
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        var result = tencent.getDailyK(allocator, symbol, days) catch {
+            continue;
+        };
+        defer result.deinit(allocator);
+
+        if (result.err_msg != null or result.items.len == 0) {
+            return 0;
+        }
+
+        const written = try upsertBars(allocator, db, symbol, result.items, start_after);
+        if (written > 0) {
+            if (latestBarDate(result.items, start_after)) |date| {
+                try updateSyncLog(allocator, db, symbol, date);
+            }
+        }
+        return written;
+    }
+
+    return 0;
 }
 
 fn ensureStockPool(allocator: std.mem.Allocator, db: *duckdb.Db) !void {
@@ -610,6 +688,31 @@ fn pendingBackfillSymbols(allocator: std.mem.Allocator, db: *duckdb.Db, target_s
     return querySymbolList(allocator, db, query);
 }
 
+fn symbolsNeedingSince(allocator: std.mem.Allocator, db: *duckdb.Db, since_date: []const u8) ![]const []const u8 {
+    const query = try std.fmt.allocPrint(allocator,
+        \\WITH universe AS (
+        \\    SELECT symbol FROM stock_info WHERE length(symbol) = 6
+        \\    UNION
+        \\    SELECT DISTINCT symbol FROM daily_k WHERE length(symbol) = 6
+        \\),
+        \\coverage AS (
+        \\    SELECT
+        \\        symbol,
+        \\        COUNT(*) FILTER (WHERE date > CAST('{s}' AS DATE)) AS rows_after_since
+        \\    FROM daily_k
+        \\    GROUP BY symbol
+        \\)
+        \\SELECT u.symbol
+        \\FROM universe u
+        \\LEFT JOIN coverage c ON c.symbol = u.symbol
+        \\WHERE COALESCE(c.rows_after_since, 0) < 5
+        \\ORDER BY u.symbol
+    , .{since_date});
+    defer allocator.free(query);
+
+    return querySymbolList(allocator, db, query);
+}
+
 fn staleUpdateTasks(allocator: std.mem.Allocator, db: *duckdb.Db, latest: []const u8) ![]const UpdateTask {
     const query = try std.fmt.allocPrint(allocator,
         \\WITH universe AS (
@@ -697,6 +800,20 @@ fn targetStartDate(allocator: std.mem.Allocator, db: *duckdb.Db, latest: []const
     return querySingleString(allocator, db, query, "1970-01-01");
 }
 
+fn fetchDaysSince(allocator: std.mem.Allocator, db: *duckdb.Db, since_date: []const u8) !u16 {
+    const latest = try latestBusinessDate(allocator, db);
+    defer allocator.free(latest);
+    const query = try std.fmt.allocPrint(allocator,
+        \\SELECT CAST(
+        \\    GREATEST(40, LEAST(800, date_diff('day', CAST('{s}' AS DATE), CAST('{s}' AS DATE)) + 30))
+        \\AS VARCHAR) AS cnt
+    , .{ since_date, latest });
+    defer allocator.free(query);
+
+    const days = try queryCount(allocator, db, query);
+    return @intCast(@min(days, 800));
+}
+
 fn querySymbolList(allocator: std.mem.Allocator, db: *duckdb.Db, query: []const u8) ![]const []const u8 {
     var rows = try db.queryRows(allocator, query);
     defer rows.deinit(allocator);
@@ -765,6 +882,18 @@ fn isSafeSymbol(s: []const u8) bool {
     if (s.len != 6) return false;
     for (s) |ch| {
         if (ch < '0' or ch > '9') return false;
+    }
+    return true;
+}
+
+fn isSafeDate(s: []const u8) bool {
+    if (s.len != 10) return false;
+    for (s, 0..) |ch, idx| {
+        if (idx == 4 or idx == 7) {
+            if (ch != '-') return false;
+        } else if (ch < '0' or ch > '9') {
+            return false;
+        }
     }
     return true;
 }
