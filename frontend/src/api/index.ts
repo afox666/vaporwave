@@ -459,8 +459,10 @@ export interface ScanAccuracyResult {
 
 let _sidecarUrl: string | null = null
 const API_BASE_STORAGE_KEY = 'vaporwave.apiBaseUrl'
-const PUBLIC_BROWSER_API_BASE_URL = 'https://photographs-adds-reprint-silent.trycloudflare.com'
+const PUBLIC_BROWSER_API_BASE_URL = 'https://47-242-147-82.sslip.io'
 const BROWSER_API_ORIGIN_ALIASES: Record<string, string> = {
+  'http://47.242.147.82:56999': PUBLIC_BROWSER_API_BASE_URL,
+  'https://47.242.147.82:56999': PUBLIC_BROWSER_API_BASE_URL,
   'http://58.252.223.53:56999': PUBLIC_BROWSER_API_BASE_URL,
   'https://58.252.223.53:56999': PUBLIC_BROWSER_API_BASE_URL,
   'http://auto.hylabpowered.com': PUBLIC_BROWSER_API_BASE_URL,
@@ -472,6 +474,7 @@ const BROWSER_API_ORIGIN_ALIASES: Record<string, string> = {
   'http://cu.hylabpowered.com:56999': PUBLIC_BROWSER_API_BASE_URL,
   'https://cu.hylabpowered.com:56999': PUBLIC_BROWSER_API_BASE_URL,
   'https://isolation-charity-sharon-chris.trycloudflare.com': PUBLIC_BROWSER_API_BASE_URL,
+  'https://photographs-adds-reprint-silent.trycloudflare.com': PUBLIC_BROWSER_API_BASE_URL,
 }
 const BROWSER_API_HOST_ALIASES: Record<string, string> = {
   'auto.hylabpowered.com': 'cu.hylabpowered.com',

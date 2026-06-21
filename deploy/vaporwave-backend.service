@@ -1,0 +1,21 @@
+[Unit]
+Description=Vaporwave Zig backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vaporwave
+Group=vaporwave
+WorkingDirectory=/opt/vaporwave
+Environment=LD_LIBRARY_PATH=/opt/vaporwave/lib
+Environment=TZ=Asia/Shanghai
+ExecStart=/opt/vaporwave/bin/vaporwave-sidecar --db /opt/vaporwave/data/market_data.db --host 0.0.0.0 --port 56999
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

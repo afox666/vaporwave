@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const optimize = b.standardOptimizeOption(.{});
+    const duckdb_lib_dir = b.option([]const u8, "duckdb-lib-dir", "Path to the DuckDB library directory");
 
     const exe = b.addExecutable(.{
         .name = "vaporwave-sidecar",
@@ -17,7 +18,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    configureDuckDb(b, exe);
+    configureDuckDb(b, exe, duckdb_lib_dir);
 
     b.installArtifact(exe);
 
@@ -38,14 +39,19 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    configureDuckDb(b, exe_tests);
+    configureDuckDb(b, exe_tests, duckdb_lib_dir);
     const run_tests = b.addRunArtifact(exe_tests);
     test_step.dependOn(&run_tests.step);
 }
 
-fn configureDuckDb(b: *std.Build, compile: *std.Build.Step.Compile) void {
+fn configureDuckDb(b: *std.Build, compile: *std.Build.Step.Compile, duckdb_lib_dir: ?[]const u8) void {
     compile.root_module.link_libc = true;
     compile.root_module.linkSystemLibrary("duckdb", .{});
+    if (duckdb_lib_dir) |dir| {
+        compile.root_module.addLibraryPath(.{ .cwd_relative = dir });
+        compile.root_module.addRPath(.{ .cwd_relative = dir });
+        return;
+    }
     const lib_dirs = [_][]const u8{
         "/opt/homebrew/opt/duckdb/lib",
         "/usr/local/opt/duckdb/lib",
