@@ -3682,23 +3682,23 @@ fn appendLocalScanCandidates(
 
     const min_coverage: u16 = @max(top_n, 1000);
     const query = try std.fmt.allocPrint(aa,
-        \\WITH amount_counts AS (
+        \\WITH liquidity_counts AS (
         \\    SELECT date, COUNT(*) AS cnt
         \\    FROM daily_k
-        \\    WHERE amount IS NOT NULL
-        \\      AND amount > 0
+        \\    WHERE COALESCE(amount, 0) > 0
+        \\       OR COALESCE(volume, 0) > 0
         \\    GROUP BY date
         \\),
         \\qualified_date AS (
         \\    SELECT date AS d
-        \\    FROM amount_counts
+        \\    FROM liquidity_counts
         \\    WHERE cnt >= {d}
         \\    ORDER BY date DESC
         \\    LIMIT 1
         \\),
         \\fallback_date AS (
         \\    SELECT date AS d
-        \\    FROM amount_counts
+        \\    FROM liquidity_counts
         \\    ORDER BY cnt DESC, date DESC
         \\    LIMIT 1
         \\),
@@ -3712,14 +3712,13 @@ fn appendLocalScanCandidates(
         \\    COALESCE(i.name, k.symbol) AS name,
         \\    k.close,
         \\    k.change_pct,
-        \\    k.amount
+        \\    COALESCE(NULLIF(k.amount, 0), k.volume * k.close, 0) AS amount
         \\FROM daily_k k
         \\LEFT JOIN stock_info i ON i.symbol = k.symbol
-        \\LEFT JOIN amount_counts ac ON ac.date = k.date
+        \\LEFT JOIN liquidity_counts ac ON ac.date = k.date
         \\WHERE k.date = (SELECT d FROM scan_date)
-        \\  AND k.amount IS NOT NULL
-        \\  AND k.amount > 0
-        \\ORDER BY k.amount DESC
+        \\  AND (COALESCE(k.amount, 0) > 0 OR COALESCE(k.volume, 0) > 0)
+        \\ORDER BY amount DESC
         \\LIMIT {d}
     , .{ min_coverage, top_n });
 
