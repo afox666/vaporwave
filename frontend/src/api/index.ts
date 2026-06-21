@@ -459,8 +459,12 @@ export interface ScanAccuracyResult {
 
 let _sidecarUrl: string | null = null
 const API_BASE_STORAGE_KEY = 'vaporwave.apiBaseUrl'
-const PUBLIC_BROWSER_API_BASE_URL = 'https://47-242-147-82.sslip.io'
+const PUBLIC_BROWSER_API_BASE_URL = 'https://54-199-223-254.sslip.io'
 const BROWSER_API_ORIGIN_ALIASES: Record<string, string> = {
+  'http://54.199.223.254:56999': PUBLIC_BROWSER_API_BASE_URL,
+  'https://54.199.223.254:56999': PUBLIC_BROWSER_API_BASE_URL,
+  'https://54-199-223-254.sslip.io:8443': PUBLIC_BROWSER_API_BASE_URL,
+  'https://47-242-147-82.sslip.io': PUBLIC_BROWSER_API_BASE_URL,
   'http://47.242.147.82:56999': PUBLIC_BROWSER_API_BASE_URL,
   'https://47.242.147.82:56999': PUBLIC_BROWSER_API_BASE_URL,
   'http://58.252.223.53:56999': PUBLIC_BROWSER_API_BASE_URL,

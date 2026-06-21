@@ -1,4 +1,8 @@
-47-242-147-82.sslip.io {
+{
+	https_port 8443
+}
+
+https://54-199-223-254.sslip.io:8443 {
 	encode gzip
 
 	@preflight method OPTIONS
