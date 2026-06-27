@@ -459,8 +459,12 @@ export interface ScanAccuracyResult {
 
 let _sidecarUrl: string | null = null
 const API_BASE_STORAGE_KEY = 'vaporwave.apiBaseUrl'
-const PUBLIC_BROWSER_API_BASE_URL = 'https://54-199-223-254.sslip.io'
+const PUBLIC_BROWSER_API_BASE_URL = 'https://server.aws-jp.focallog.com'
 const BROWSER_API_ORIGIN_ALIASES: Record<string, string> = {
+  'http://35.74.91.142:56999': PUBLIC_BROWSER_API_BASE_URL,
+  'https://35.74.91.142:56999': PUBLIC_BROWSER_API_BASE_URL,
+  'https://server.aws-jp.focallog.com:8443': PUBLIC_BROWSER_API_BASE_URL,
+  'https://54-199-223-254.sslip.io': PUBLIC_BROWSER_API_BASE_URL,
   'http://54.199.223.254:56999': PUBLIC_BROWSER_API_BASE_URL,
   'https://54.199.223.254:56999': PUBLIC_BROWSER_API_BASE_URL,
   'https://54-199-223-254.sslip.io:8443': PUBLIC_BROWSER_API_BASE_URL,
