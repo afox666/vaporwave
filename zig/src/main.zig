@@ -1444,16 +1444,6 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     const body_start = header_len orelse request_data.len;
     const body_end = @min(request_data.len, body_start + body_len);
     const request_body = request_data[body_start..body_end];
-    var request_db: ?duckdb.Db = null;
-    defer if (request_db) |*d| d.close();
-
-    if (db_path) |path| {
-        request_db = openDatabase(allocator, path) catch |err| blk: {
-            std.debug.print("DuckDB open failed: {any}\n", .{err});
-            break :blk null;
-        };
-    }
-    const active_db = if (request_db) |*d| d else null;
 
     const newline = std.mem.indexOf(u8, request_data, "\r\n") orelse return;
     const request_line = request_data[0..newline];
@@ -1476,6 +1466,22 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
         try http.respond(stream, 405, err_json);
         return;
     }
+
+    if (is_get and std.mem.eql(u8, uri, "/api/health")) {
+        try http.respondJson(allocator, stream, 200, .{ .status = "ok" });
+        return;
+    }
+
+    var request_db: ?duckdb.Db = null;
+    defer if (request_db) |*d| d.close();
+
+    if (db_path) |path| {
+        request_db = openDatabase(allocator, path) catch |err| blk: {
+            std.debug.print("DuckDB open failed: {any}\n", .{err});
+            break :blk null;
+        };
+    }
+    const active_db = if (request_db) |*d| d else null;
 
     if (is_post and std.mem.startsWith(u8, uri, "/api/scan/run")) {
         try handle_scan(allocator, stream, uri, active_db);
@@ -1634,11 +1640,6 @@ fn handle_connection(allocator: std.mem.Allocator, stream: std.net.Stream, db_pa
     if (std.mem.startsWith(u8, uri, "/api/backtest/tasks/")) {
         const task_id = http.stripQuery(uri)["/api/backtest/tasks/".len..];
         try handle_backtest_task_get(allocator, stream, task_id, db_path);
-        return;
-    }
-
-    if (std.mem.eql(u8, uri, "/api/health")) {
-        try http.respondJson(allocator, stream, 200, .{ .status = "ok" });
         return;
     }
 
@@ -3918,13 +3919,13 @@ fn rebuildScanPeriodSnapshot(
         \\scan_base AS (
         \\    SELECT
         \\        sr.scan_date,
-        \\        COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date) AS data_date,
+        \\        COALESCE(sr.data_date, sr.scan_date) AS data_date,
         \\        GREATEST(COALESCE(sr.top_n, 100), 1) AS daily_top_n,
         \\        ss.symbol
         \\    FROM scan_result sr
         \\    JOIN scan_stock ss ON ss.scan_date = sr.scan_date
         \\    JOIN period_bounds pb ON TRUE
-        \\    WHERE COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date)
+        \\    WHERE COALESCE(sr.data_date, sr.scan_date)
         \\          BETWEEN pb.period_start AND pb.period_end
         \\),
         \\chosen_scan_dates AS (
@@ -3984,7 +3985,7 @@ fn rebuildScanPeriodSnapshot(
         \\scan_base AS (
         \\    SELECT
         \\        sr.scan_date,
-        \\        COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date) AS data_date,
+        \\        COALESCE(sr.data_date, sr.scan_date) AS data_date,
         \\        CAST(GREATEST(COALESCE(sr.top_n, 100), 1) AS DOUBLE) AS daily_top_n,
         \\        ss.rank,
         \\        ss.symbol,
@@ -3996,7 +3997,7 @@ fn rebuildScanPeriodSnapshot(
         \\    FROM scan_result sr
         \\    JOIN scan_stock ss ON ss.scan_date = sr.scan_date
         \\    JOIN period_bounds pb ON TRUE
-        \\    WHERE COALESCE(sr.data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= sr.scan_date), sr.scan_date)
+        \\    WHERE COALESCE(sr.data_date, sr.scan_date)
         \\          BETWEEN pb.period_start AND pb.period_end
         \\),
         \\chosen_scan_dates AS (
@@ -4140,7 +4141,7 @@ fn rebuildScanPeriodSnapshots(allocator: std.mem.Allocator, d: *duckdb.Db, reque
         aa,
         \\WITH scan_dates AS (
         \\    SELECT DISTINCT
-        \\        COALESCE(data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= scan_date), scan_date) AS data_date
+        \\        COALESCE(data_date, scan_date) AS data_date
         \\    FROM scan_result
         \\)
         \\SELECT DISTINCT CAST(date_trunc('{s}', data_date) AS DATE)::VARCHAR AS period_start
@@ -4296,7 +4297,7 @@ fn handle_scan_history(allocator: std.mem.Allocator, stream: std.net.Stream, db:
         var result = d.queryRows(allocator,
             \\SELECT
             \\    CAST(scan_date AS VARCHAR) AS scan_date,
-            \\    CAST(COALESCE(data_date, (SELECT MAX(k.date) FROM daily_k k WHERE k.date <= scan_result.scan_date), scan_date) AS VARCHAR) AS data_date,
+            \\    CAST(COALESCE(data_date, scan_date) AS VARCHAR) AS data_date,
             \\    top_n,
             \\    total_stocks,
             \\    COALESCE(source, '') AS source,
