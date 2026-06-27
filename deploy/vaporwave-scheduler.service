@@ -10,7 +10,7 @@ Group=vaporwave
 WorkingDirectory=/opt/vaporwave
 Environment=LD_LIBRARY_PATH=/opt/vaporwave/lib
 Environment=TZ=Asia/Shanghai
-ExecStart=/opt/vaporwave/bin/vaporwave-sidecar --db /opt/vaporwave/data/market_data.db --scheduler run --interval-seconds 30
+ExecStart=/opt/vaporwave/bin/vaporwave-sidecar --db /opt/vaporwave/data/market_data.db --scheduler run --interval-seconds 300
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
