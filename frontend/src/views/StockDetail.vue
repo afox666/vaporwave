@@ -5,6 +5,8 @@ import { getStockFull, getDailyK } from '../api'
 import * as echarts from 'echarts'
 import CRTFrame from '../components/CRTFrame.vue'
 import NeonBar from '../components/NeonBar.vue'
+import KLineZoomControls from '../components/KLineZoomControls.vue'
+import { useKLineZoom } from '../composables/useKLineZoom'
 import type { DailyKRecord } from '../api'
 
 const route = useRoute()
@@ -15,6 +17,7 @@ const loading = ref(true)
 const errorMessage = ref('')
 const chartRef = ref<HTMLElement | null>(null)
 let chart: echarts.ECharts | null = null
+const { canZoomIn, canZoomOut, getDataZoomOption, setCategories, syncZoomWindow, zoomKLine } = useKLineZoom(() => chart)
 
 function getQueryString(name: string): string | null {
   const value = route.query[name]
@@ -178,6 +181,7 @@ function buildChart() {
 
   if (!chart) {
     chart = echarts.init(chartRef.value, undefined, { renderer: 'canvas' })
+    chart.on('datazoom', syncZoomWindow)
   }
 
   const sorted = [...kRecords.value].sort((a, b) => a.date.localeCompare(b.date))
@@ -193,6 +197,7 @@ function buildChart() {
 
   const upColor = '#ff3b3b'
   const downColor = '#00c853'
+  const zoomWindow = setCategories(dates)
 
   const option: echarts.EChartsOption = {
     animation: false,
@@ -231,8 +236,7 @@ function buildChart() {
       { scale: true, splitArea: { show: false }, splitLine: { show: false }, axisLine: { lineStyle: { color: '#3a2a6a' } }, axisLabel: { show: false }, gridIndex: 1 },
     ],
     dataZoom: [
-      { type: 'inside', xAxisIndex: [0, 1], start: 60, end: 100, minValueSpan: 5 },
-      { type: 'slider', xAxisIndex: [0, 1], bottom: 5, start: 60, end: 100, borderColor: '#3a2a6a', backgroundColor: '#0a0a1a', fillerColor: '#bf00ff15', handleStyle: { color: '#bf00ff' }, textStyle: { color: '#8070b0', fontFamily: 'VT323', fontSize: 10 }, height: 16 },
+      getDataZoomOption([0, 1]),
     ],
     series: [
       { name: '日K', type: 'candlestick', data: ohlc, itemStyle: { color: upColor, color0: downColor, borderColor: upColor, borderColor0: downColor }, barMaxWidth: 16, xAxisIndex: 0, yAxisIndex: 0 },
@@ -245,6 +249,12 @@ function buildChart() {
   }
 
   chart.setOption(option, true)
+  chart.dispatchAction({
+    type: 'dataZoom',
+    dataZoomId: 'kline-inside-zoom',
+    startValue: zoomWindow.startValue,
+    endValue: zoomWindow.endValue,
+  } as any)
   chart.resize()
 }
 
@@ -290,6 +300,11 @@ window.addEventListener('resize', () => chart?.resize())
         <!-- K-Line Chart -->
         <div class="kline-chart-wrapper">
           <div ref="chartRef" class="kline-chart"></div>
+          <KLineZoomControls
+            :can-zoom-in="canZoomIn"
+            :can-zoom-out="canZoomOut"
+            @zoom="zoomKLine"
+          />
         </div>
       </CRTFrame>
 
@@ -387,10 +402,17 @@ window.addEventListener('resize', () => chart?.resize())
 
 .kline-chart-wrapper {
   margin-top: 1rem;
+  position: relative;
 }
 
 .kline-chart {
   width: 100%;
   height: 400px;
+  cursor: grab;
+  touch-action: pan-y;
+}
+
+.kline-chart:active {
+  cursor: grabbing;
 }
 </style>

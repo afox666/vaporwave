@@ -3,6 +3,8 @@ import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getDailyK, getStockBasic } from '../api'
 import CRTFrame from '../components/CRTFrame.vue'
+import KLineZoomControls from '../components/KLineZoomControls.vue'
+import { useKLineZoom } from '../composables/useKLineZoom'
 import type { DailyKRecord } from '../api'
 import * as echarts from 'echarts'
 
@@ -104,12 +106,14 @@ watch(
 // ECharts
 const chartRef = ref<HTMLElement | null>(null)
 let chart: echarts.ECharts | null = null
+const { canZoomIn, canZoomOut, getDataZoomOption, setCategories, syncZoomWindow, zoomKLine } = useKLineZoom(() => chart)
 
 function buildChart() {
   if (!chartRef.value || records.value.length === 0) return
 
   if (!chart) {
     chart = echarts.init(chartRef.value, undefined, { renderer: 'canvas' })
+    chart.on('datazoom', syncZoomWindow)
   }
 
   const sorted = [...records.value].sort((a, b) => a.date.localeCompare(b.date))
@@ -128,6 +132,7 @@ function buildChart() {
 
   const upColor = '#ff3b3b'
   const downColor = '#00c853'
+  const zoomWindow = setCategories(dates)
 
   const option: echarts.EChartsOption = {
     animation: false,
@@ -204,25 +209,7 @@ function buildChart() {
       },
     ],
     dataZoom: [
-      {
-        type: 'inside',
-        xAxisIndex: [0, 1],
-        start: 50,
-        end: 100,
-        minValueSpan: 5,
-      },
-      {
-        type: 'slider',
-        xAxisIndex: [0, 1],
-        bottom: 10,
-        start: 50,
-        end: 100,
-        borderColor: '#3a2a6a',
-        backgroundColor: '#0a0a1a',
-        fillerColor: '#bf00ff15',
-        handleStyle: { color: '#bf00ff' },
-        textStyle: { color: '#8070b0', fontFamily: 'VT323' },
-      },
+      getDataZoomOption([0, 1]),
     ],
     series: [
       // Candlestick
@@ -308,6 +295,12 @@ function buildChart() {
   }
 
   chart.setOption(option, true) // true = notMerge, replace all data
+  chart.dispatchAction({
+    type: 'dataZoom',
+    dataZoomId: 'kline-inside-zoom',
+    startValue: zoomWindow.startValue,
+    endValue: zoomWindow.endValue,
+  } as any)
   chart.resize()
 }
 
@@ -406,7 +399,14 @@ const sortedDesc = computed(() => [...records.value].sort((a, b) => b.date.local
 
       <!-- K-Line Chart -->
       <CRTFrame title="DAILY K-LINE CHART" class="chart-card">
-        <div ref="chartRef" class="chart-container"></div>
+        <div class="chart-shell">
+          <div ref="chartRef" class="chart-container"></div>
+          <KLineZoomControls
+            :can-zoom-in="canZoomIn"
+            :can-zoom-out="canZoomOut"
+            @zoom="zoomKLine"
+          />
+        </div>
       </CRTFrame>
 
       <!-- Data Table -->
@@ -548,6 +548,16 @@ const sortedDesc = computed(() => [...records.value].sort((a, b) => b.date.local
 .chart-container {
   width: 100%;
   height: 550px;
+  cursor: grab;
+  touch-action: pan-y;
+}
+
+.chart-container:active {
+  cursor: grabbing;
+}
+
+.chart-shell {
+  position: relative;
 }
 
 .table-card {
