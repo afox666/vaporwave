@@ -11,6 +11,8 @@ type ZoomWindow = {
 const DEFAULT_VISIBLE_POINTS = 120
 const MIN_VISIBLE_POINTS = 20
 const ZOOM_STEP_RATIO = 0.28
+const WHEEL_PIXELS_PER_POINT = 90
+const MAX_WHEEL_STEP_RATIO = 0.04
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -24,6 +26,7 @@ export function useKLineZoom(getChart: () => ECharts | null) {
   const pointCount = ref(0)
   const categories = ref<string[]>([])
   const zoomWindow = ref<ZoomWindow>({ startValue: 0, endValue: 0 })
+  let wheelRemainder = 0
 
   const minVisiblePoints = computed(() => Math.min(MIN_VISIBLE_POINTS, Math.max(pointCount.value, 1)))
   const canZoomIn = computed(() => visiblePointCount(zoomWindow.value) > minVisiblePoints.value)
@@ -116,7 +119,7 @@ export function useKLineZoom(getChart: () => ECharts | null) {
       minValueSpan: minVisiblePoints.value,
       zoomOnMouseWheel: false,
       moveOnMouseMove: true,
-      moveOnMouseWheel: true,
+      moveOnMouseWheel: false,
       preventDefaultMouseMove: true,
       throttle: 40,
     }
@@ -162,10 +165,39 @@ export function useKLineZoom(getChart: () => ECharts | null) {
     applyZoomWindow({ startValue, endValue })
   }
 
+  function panKLineByWheel(event: WheelEvent) {
+    if (pointCount.value <= 1) return
+
+    const absX = Math.abs(event.deltaX)
+    const absY = Math.abs(event.deltaY)
+    const shouldPan = absX > absY * 0.6 || event.shiftKey
+    if (!shouldPan) return
+
+    event.preventDefault()
+
+    const rawDelta = event.shiftKey && absY > absX ? event.deltaY : event.deltaX
+    if (Math.abs(rawDelta) < 0.5) return
+
+    const current = readWindowFromChart()
+    const visible = visiblePointCount(current)
+    const maxStep = Math.max(1, Math.round(visible * MAX_WHEEL_STEP_RATIO))
+
+    wheelRemainder += rawDelta / WHEEL_PIXELS_PER_POINT
+    const step = clamp(Math.trunc(wheelRemainder), -maxStep, maxStep)
+    if (step === 0) return
+
+    wheelRemainder -= step
+    applyZoomWindow({
+      startValue: current.startValue + step,
+      endValue: current.endValue + step,
+    })
+  }
+
   return {
     canZoomIn,
     canZoomOut,
     getDataZoomOption,
+    panKLineByWheel,
     setCategories,
     syncZoomWindow,
     zoomKLine,

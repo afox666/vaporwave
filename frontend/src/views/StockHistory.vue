@@ -106,7 +106,7 @@ watch(
 // ECharts
 const chartRef = ref<HTMLElement | null>(null)
 let chart: echarts.ECharts | null = null
-const { canZoomIn, canZoomOut, getDataZoomOption, setCategories, syncZoomWindow, zoomKLine } = useKLineZoom(() => chart)
+const { canZoomIn, canZoomOut, getDataZoomOption, panKLineByWheel, setCategories, syncZoomWindow, zoomKLine } = useKLineZoom(() => chart)
 
 function buildChart() {
   if (!chartRef.value || records.value.length === 0) return
@@ -400,7 +400,7 @@ const sortedDesc = computed(() => [...records.value].sort((a, b) => b.date.local
       <!-- K-Line Chart -->
       <CRTFrame title="DAILY K-LINE CHART" class="chart-card">
         <div class="chart-shell">
-          <div ref="chartRef" class="chart-container"></div>
+          <div ref="chartRef" class="chart-container" @wheel="panKLineByWheel"></div>
           <KLineZoomControls
             :can-zoom-in="canZoomIn"
             :can-zoom-out="canZoomOut"

@@ -17,7 +17,7 @@ const loading = ref(true)
 const errorMessage = ref('')
 const chartRef = ref<HTMLElement | null>(null)
 let chart: echarts.ECharts | null = null
-const { canZoomIn, canZoomOut, getDataZoomOption, setCategories, syncZoomWindow, zoomKLine } = useKLineZoom(() => chart)
+const { canZoomIn, canZoomOut, getDataZoomOption, panKLineByWheel, setCategories, syncZoomWindow, zoomKLine } = useKLineZoom(() => chart)
 
 function getQueryString(name: string): string | null {
   const value = route.query[name]
@@ -299,7 +299,7 @@ window.addEventListener('resize', () => chart?.resize())
 
         <!-- K-Line Chart -->
         <div class="kline-chart-wrapper">
-          <div ref="chartRef" class="kline-chart"></div>
+          <div ref="chartRef" class="kline-chart" @wheel="panKLineByWheel"></div>
           <KLineZoomControls
             :can-zoom-in="canZoomIn"
             :can-zoom-out="canZoomOut"
