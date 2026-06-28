@@ -9,6 +9,11 @@ import KLineZoomControls from '../components/KLineZoomControls.vue'
 import { useKLineZoom } from '../composables/useKLineZoom'
 import type { DailyKRecord } from '../api'
 
+type StockNameParts = {
+  prefix: string
+  name: string
+}
+
 const route = useRoute()
 const symbol = computed(() => route.params.symbol as string)
 const data = ref<any>(null)
@@ -45,11 +50,33 @@ function formatScore(score: unknown): string {
   return Number.isFinite(parsed) ? `${parsed.toFixed(0)}/100` : '--/100'
 }
 
+function toDisplayText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function splitStockName(value: unknown): StockNameParts {
+  const raw = toDisplayText(value)
+  const match = raw.match(/^(\*ST|ST|XD|XR|DR|N|C)(.+)$/i)
+  if (!match) return { prefix: '', name: raw }
+  return {
+    prefix: match[1].toUpperCase(),
+    name: match[2].trim() || raw,
+  }
+}
+
+function isBetterStockName(candidate: string, current: string): boolean {
+  if (!candidate || candidate === symbol.value) return false
+  if (!current) return true
+  if (candidate.length > current.length) return true
+  return candidate.length === current.length && /[\u4e00-\u9fff]/.test(candidate) && !/[\u4e00-\u9fff]/.test(current)
+}
+
 function normalizeStockFull(raw: any, sym: string) {
   const context = getRouteContext()
   const hasRawScore = raw && Object.prototype.hasOwnProperty.call(raw, 'score') && raw.score != null
   const normalized = {
     symbol: raw?.symbol || sym,
+    name: raw?.name || context.name || sym,
     score: hasRawScore ? Number(raw.score) : context.score,
     basic: raw?.basic && typeof raw.basic === 'object' ? { ...raw.basic } : {},
     profile: raw?.profile && typeof raw.profile === 'object' ? { ...raw.profile } : {},
@@ -145,6 +172,41 @@ const scoreColor = computed(() => {
   if (s >= 70) return '#00fff7'
   if (s >= 50) return '#ffd700'
   return '#00c853'
+})
+
+const stockNameDisplay = computed(() => {
+  const tradingName = splitStockName(data.value?.basic?.['股票简称'] || data.value?.name)
+  const preferredCandidates = [
+    data.value?.profile?.['A股简称'],
+    data.value?.profile?.a_name,
+  ]
+  const fallbackCandidates = [
+    data.value?.profile?.['公司名称'],
+    data.value?.profile?.company_name,
+    data.value?.name,
+    data.value?.basic?.['股票简称'],
+  ]
+
+  let name = ''
+  for (const candidate of preferredCandidates) {
+    const cleaned = splitStockName(candidate).name
+    if (isBetterStockName(cleaned, name)) {
+      name = cleaned
+    }
+  }
+  if (!name) {
+    for (const candidate of fallbackCandidates) {
+      const cleaned = splitStockName(candidate).name
+      if (isBetterStockName(cleaned, name)) {
+        name = cleaned
+      }
+    }
+  }
+
+  return {
+    prefix: tradingName.prefix,
+    name: name || tradingName.name || symbol.value,
+  }
 })
 
 const techTags = computed(() => {
@@ -267,14 +329,16 @@ window.addEventListener('resize', () => chart?.resize())
 
     <template v-else-if="data">
       <!-- Header -->
-      <div class="flex-between mb-3">
-        <div>
-          <h2 class="neon-title" style="text-align: left; font-size: 1.4rem">
-            {{ data.basic['股票简称'] || symbol }} ({{ symbol }})
+      <div class="stock-title-row mb-3">
+        <div class="stock-title-block">
+          <h2 class="neon-title stock-title">
+            <span v-if="stockNameDisplay.prefix" class="stock-status-prefix">{{ stockNameDisplay.prefix }}</span>
+            <span class="stock-title-name">{{ stockNameDisplay.name }}</span>
+            <span class="stock-title-symbol">({{ symbol }})</span>
           </h2>
-          <p class="neon-subtitle mt-1">
-            ¥{{ data.valuation.price?.current || data.basic['最新'] || '--' }}
-            <span class="neon-tag" :style="{ color: scoreColor, borderColor: scoreColor, marginLeft: '1rem' }">
+          <p class="neon-subtitle stock-price-row mt-1">
+            <span>¥{{ data.valuation.price?.current || data.basic['最新'] || '--' }}</span>
+            <span class="neon-tag" :style="{ color: scoreColor, borderColor: scoreColor }">
               综合评分: {{ formatScore(data.score) }}
             </span>
           </p>
@@ -383,6 +447,68 @@ window.addEventListener('resize', () => chart?.resize())
 </template>
 
 <style scoped>
+.stock-title-row {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.stock-title-block {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.stock-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.7rem;
+  text-align: left;
+  font-size: clamp(1rem, 2.4vw, 1.4rem);
+  line-height: 1.7;
+  overflow: visible;
+}
+
+.stock-title-name,
+.stock-title-symbol {
+  display: inline-block;
+  background: var(--gradient-sunset);
+  -webkit-background-clip: text;
+  background-clip: text;
+  overflow-wrap: anywhere;
+  -webkit-text-fill-color: transparent;
+}
+
+.stock-title-symbol {
+  white-space: nowrap;
+}
+
+.stock-status-prefix {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 2.1rem;
+  padding: 0.16rem 0.3rem;
+  border: 1px solid #00fff780;
+  border-radius: 3px;
+  background: rgba(0, 255, 247, 0.08);
+  color: var(--neon-cyan);
+  font-family: var(--font-retro);
+  font-size: 0.62em;
+  line-height: 1.2;
+  letter-spacing: 1px;
+  text-shadow: 0 0 8px #00fff760;
+  -webkit-text-fill-color: var(--neon-cyan);
+}
+
+.stock-price-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem 1rem;
+}
+
 .detail-row {
   display: flex;
   justify-content: space-between;
