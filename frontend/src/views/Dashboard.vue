@@ -13,13 +13,13 @@ const loading = ref(true)
 const dataSource = ref('')
 const signalDate = ref('')
 const scanProgress = ref(0)
-const scanStatus = ref('')
+const loadMode = ref<'snapshot' | 'scan'>('snapshot')
 const searchQuery = ref('')
 const searchResults = ref<StockSearchResult[]>([])
 const showDropdown = ref(false)
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let progressRunId = 0
 
-// Scanning progress animation
 const scanSteps = [
   { at: 5, text: '连接数据源...' },
   { at: 15, text: '获取A股实时行情...' },
@@ -30,21 +30,39 @@ const scanSteps = [
   { at: 95, text: '即将完成...' },
 ]
 
+const snapshotSteps = [
+  { at: 15, text: '连接历史快照...' },
+  { at: 45, text: '读取最近榜单...' },
+  { at: 75, text: '整理市场快照...' },
+  { at: 95, text: '即将完成...' },
+]
+
+const activeLoadSteps = computed(() => loadMode.value === 'scan' ? scanSteps : snapshotSteps)
+
 const currentStatusText = computed(() => {
   const p = scanProgress.value
-  let text = '扫描中...'
-  for (const step of scanSteps) {
+  let text = loadMode.value === 'scan' ? '扫描中...' : '读取中...'
+  for (const step of activeLoadSteps.value) {
     if (p >= step.at) text = step.text
   }
   return text
 })
 
+const sourceLabel = computed(() => {
+  if (dataSource.value === 'scan') return '实时扫描'
+  if (dataSource.value === 'history') return '历史快照'
+  if (dataSource.value === 'db') return '本地候选池'
+  return dataSource.value
+})
+
 function animateProgress(target: number) {
+  const runId = ++progressRunId
   const start = scanProgress.value
   const duration = 8000 // ms for full animation
   const startTime = performance.now()
 
   function tick(now: number) {
+    if (runId !== progressRunId) return
     const elapsed = now - startTime
     const t = Math.min(elapsed / duration, 1)
     // Ease out: starts fast, slows down
@@ -55,55 +73,86 @@ function animateProgress(target: number) {
   requestAnimationFrame(tick)
 }
 
-async function loadMarketSnapshot() {
-  try {
-    return await scanMarket(100)
-  } catch {
-    const history = await getScanHistory()
-    const latest = history.data[0]
-    if (!latest) {
-      return { data: { total: 0, stocks: [], source: '', data_date: '' } }
-    }
+function finishProgress() {
+  progressRunId += 1
+  scanProgress.value = 100
+}
 
-    const detail = await getScanHistoryDetail(latest.scan_date)
-    const cachedStocks: StockInfo[] = detail.data.stocks.map(stock => ({
-      symbol: stock.symbol,
-      name: stock.name,
-      price: stock.price ?? 0,
-      change_pct: stock.change_pct ?? 0,
-      score: stock.score ?? 0,
-      industry: stock.industry || 'N/A',
-    }))
+function emptyMarketSnapshot() {
+  return { data: { total: 0, stocks: [], source: '', data_date: '' } }
+}
 
-    return {
-      data: {
-        total: cachedStocks.length,
-        stocks: cachedStocks,
-        source: 'db',
-        data_date: '',
-      },
-    }
+async function loadCachedMarketSnapshot() {
+  const history = await getScanHistory()
+  const latest = history.data[0]
+  if (!latest) return emptyMarketSnapshot()
+
+  const detail = await getScanHistoryDetail(latest.scan_date)
+  const cachedStocks: StockInfo[] = detail.data.stocks.map(stock => ({
+    symbol: stock.symbol,
+    name: stock.name,
+    price: stock.price ?? 0,
+    change_pct: stock.change_pct ?? 0,
+    score: stock.score ?? 0,
+    industry: stock.industry || 'N/A',
+  }))
+
+  return {
+    data: {
+      total: latest.total_stocks || cachedStocks.length,
+      stocks: cachedStocks,
+      source: cachedStocks.length > 0 ? 'history' : '',
+      data_date: latest.data_date || latest.scan_date || '',
+    },
   }
 }
 
-onMounted(async () => {
-  // Start progress animation immediately
+function applyMarketSnapshot(snapshot: Awaited<ReturnType<typeof scanMarket>>) {
+  signalDate.value = snapshot.data.data_date || ''
+  stocks.value = snapshot.data.stocks || []
+  dataSource.value = snapshot.data.source || ''
+}
+
+async function loadDashboardSnapshot(mode: 'snapshot' | 'scan') {
+  loading.value = true
+  loadMode.value = mode
+  scanProgress.value = 0
   animateProgress(95)
 
-  const [scanRes, factorRes] = await Promise.all([
-    loadMarketSnapshot().catch(() => ({ data: { stocks: [], source: '', data_date: '' } })),
-    getFactors().catch(() => ({ data: [] })),
+  const marketPromise = mode === 'scan' ? scanMarket(100) : loadCachedMarketSnapshot()
+  const factorPromise = factors.value.length > 0
+    ? Promise.resolve({ data: factors.value })
+    : getFactors()
+
+  const [marketRes, factorRes] = await Promise.all([
+    marketPromise.catch(e => {
+      console.error(e)
+      return stocks.value.length > 0 ? null : emptyMarketSnapshot()
+    }),
+    factorPromise.catch(e => {
+      console.error(e)
+      return { data: factors.value }
+    }),
   ])
-  signalDate.value = scanRes.data.data_date || ''
-  stocks.value = scanRes.data.stocks || []
-  dataSource.value = scanRes.data.source || ''
+
+  if (marketRes) {
+    applyMarketSnapshot(marketRes)
+  }
   factors.value = factorRes.data
 
-  // Complete progress
-  scanProgress.value = 100
+  finishProgress()
   await new Promise(r => setTimeout(r, 300))
   loading.value = false
+}
+
+onMounted(() => {
+  loadDashboardSnapshot('snapshot')
 })
+
+function refreshMarketSnapshot() {
+  if (loading.value) return
+  loadDashboardSnapshot('scan')
+}
 
 function stockQuery(stock: StockInfo) {
   return {
@@ -223,11 +272,16 @@ function goHistory() {
     <!-- Market Snapshot -->
     <div class="mt-4">
       <div class="section-title-row">
-        <h2 class="section-title" style="margin-bottom: 0">&#x1F4C8; 市场快照</h2>
-        <div class="source-badges">
-          <span v-if="dataSource" class="source-badge" :class="dataSource">{{ dataSource === 'db' ? '本地候选池' : '实时扫描' }}</span>
-          <span v-if="dataSource === 'db' && signalDate" class="source-badge signal-date">候选池基于 {{ signalDate }}</span>
+        <div class="title-with-source">
+          <h2 class="section-title" style="margin-bottom: 0">&#x1F4C8; 市场快照</h2>
+          <div class="source-badges">
+            <span v-if="dataSource" class="source-badge" :class="dataSource">{{ sourceLabel }}</span>
+            <span v-if="signalDate" class="source-badge signal-date">数据 {{ signalDate }}</span>
+          </div>
         </div>
+        <button class="neon-btn snapshot-refresh-btn" @click="refreshMarketSnapshot" :disabled="loading">
+          {{ loading && loadMode === 'scan' ? '扫描中...' : '刷新扫描' }}
+        </button>
       </div>
 
       <div v-if="loading" class="scan-progress-card">
@@ -242,7 +296,7 @@ function goHistory() {
           </div>
         </div>
         <div class="scan-terminal-log">
-          <div v-for="step in scanSteps" :key="step.at" class="log-line" :class="{ active: scanProgress >= step.at }">
+          <div v-for="step in activeLoadSteps" :key="step.at" class="log-line" :class="{ active: scanProgress >= step.at }">
             <span class="log-check">{{ scanProgress >= step.at ? '[DONE]' : '[....]' }}</span>
             <span class="log-text">{{ step.text }}</span>
           </div>
@@ -382,7 +436,16 @@ function goHistory() {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 1rem;
   margin-bottom: 1rem;
+}
+
+.title-with-source {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .source-badges {
@@ -390,7 +453,7 @@ function goHistory() {
   gap: 0.5rem;
   align-items: center;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: flex-start;
 }
 
 .source-badge {
@@ -413,10 +476,27 @@ function goHistory() {
   background: rgba(255, 215, 0, 0.05);
 }
 
+.source-badge.history {
+  color: #00fff7;
+  border: 1px solid #00fff740;
+  background: rgba(0, 255, 247, 0.05);
+}
+
 .source-badge.signal-date {
   color: var(--neon-cyan);
   border: 1px solid #00fff740;
   background: rgba(0, 255, 247, 0.05);
+}
+
+.snapshot-refresh-btn {
+  flex-shrink: 0;
+  padding: 0.55rem 1rem;
+  font-size: 0.75rem;
+}
+
+.snapshot-refresh-btn:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .factor-grid {
