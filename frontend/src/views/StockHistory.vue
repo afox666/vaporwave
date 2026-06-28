@@ -5,6 +5,7 @@ import { getDailyK, getStockBasic } from '../api'
 import CRTFrame from '../components/CRTFrame.vue'
 import KLineZoomControls from '../components/KLineZoomControls.vue'
 import { useKLineZoom } from '../composables/useKLineZoom'
+import { normalizeDailyKVolumes } from '../utils/dailyK'
 import type { DailyKRecord } from '../api'
 import * as echarts from 'echarts'
 
@@ -67,7 +68,7 @@ async function loadData() {
       getStockBasic(symbol.value),
     ])
     if (res.status === 'fulfilled') {
-      records.value = res.value.data
+      records.value = normalizeDailyKVolumes(res.value.data)
     } else {
       error.value = res.reason?.response?.data?.detail || '加载失败'
       records.value = []

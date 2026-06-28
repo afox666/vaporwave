@@ -7,6 +7,7 @@ import CRTFrame from '../components/CRTFrame.vue'
 import NeonBar from '../components/NeonBar.vue'
 import KLineZoomControls from '../components/KLineZoomControls.vue'
 import { useKLineZoom } from '../composables/useKLineZoom'
+import { normalizeDailyKVolumes } from '../utils/dailyK'
 import type { DailyKRecord } from '../api'
 
 type StockNameParts = {
@@ -143,7 +144,7 @@ async function loadStock(sym: string) {
 
     const normalized = normalizeStockFull(fullRes.data, sym)
     data.value = normalized
-    kRecords.value = kRes.data?.length ? kRes.data : normalized.kline
+    kRecords.value = normalizeDailyKVolumes(kRes.data?.length ? kRes.data : normalized.kline)
 
     if (!fullRes.data && kRecords.value.length === 0) {
       errorMessage.value = '无法获取该股票详情数据'

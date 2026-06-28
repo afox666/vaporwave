@@ -1966,30 +1966,10 @@ fn handle_stock_kline(allocator: std.mem.Allocator, stream: std.net.Stream, symb
         return;
     }
 
-    var out = std.io.Writer.Allocating.init(allocator);
-    defer out.deinit();
+    const bars = try dailyBarsFromKlineItems(allocator, result.items);
+    defer freeDailyBars(allocator, bars);
 
-    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    try s.beginArray();
-    for (result.items) |kline| {
-        try s.beginObject();
-        try s.objectField("date");
-        try s.write(kline.date);
-        try s.objectField("open");
-        try s.write(kline.open);
-        try s.objectField("close");
-        try s.write(kline.close);
-        try s.objectField("high");
-        try s.write(kline.high);
-        try s.objectField("low");
-        try s.write(kline.low);
-        try s.objectField("volume");
-        try s.write(kline.volume);
-        try s.endObject();
-    }
-    try s.endArray();
-
-    try http.respond(stream, 200, out.written());
+    try writeDailyBarsArray(stream, allocator, bars);
 }
 
 // ============================================================
@@ -2136,6 +2116,31 @@ fn normalizeDailyBarVolumes(bars: []DailyBar) void {
         }
         next_volume = bar.volume;
     }
+}
+
+fn dailyBarsFromKlineItems(allocator: std.mem.Allocator, items: []const eastmoney.KlineItem) ![]DailyBar {
+    var bars = std.ArrayList(DailyBar){ .items = &.{}, .capacity = 0 };
+    errdefer {
+        for (bars.items) |bar| allocator.free(bar.date);
+        bars.deinit(allocator);
+    }
+
+    for (items) |item| {
+        try bars.append(allocator, DailyBar{
+            .date = try allocator.dupe(u8, item.date),
+            .open = item.open,
+            .close = item.close,
+            .high = item.high,
+            .low = item.low,
+            .volume = item.volume,
+            .amount = item.amount,
+            .change_pct = item.change_pct,
+        });
+    }
+
+    const owned = try bars.toOwnedSlice(allocator);
+    normalizeDailyBarVolumes(owned);
+    return owned;
 }
 
 test "daily k volume normalization converts hand volume to shares" {
@@ -2812,22 +2817,21 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
     try query.appendSlice(aa, symbol);
     try query.appendSlice(aa, "'");
 
-    if (start_date) |sd| {
-        if (isSafeDate(sd)) {
-            try query.appendSlice(aa, " AND date >= DATE '");
-            try query.appendSlice(aa, sd);
-            try query.appendSlice(aa, "'");
-        }
+    const output_start_date = if (start_date) |sd| if (isSafeDate(sd)) sd else null else null;
+    const output_end_date = if (end_date) |ed| if (isSafeDate(ed)) ed else null else null;
+
+    if (output_start_date) |sd| {
+        try query.appendSlice(aa, " AND date >= DATE '");
+        try query.appendSlice(aa, sd);
+        try query.appendSlice(aa, "' - INTERVAL 45 DAY");
     } else if (end_date == null) {
         try query.appendSlice(aa, " AND date >= CURRENT_DATE - INTERVAL 1 YEAR");
     }
 
-    if (end_date) |ed| {
-        if (isSafeDate(ed)) {
-            try query.appendSlice(aa, " AND date <= DATE '");
-            try query.appendSlice(aa, ed);
-            try query.appendSlice(aa, "'");
-        }
+    if (output_end_date) |ed| {
+        try query.appendSlice(aa, " AND date <= DATE '");
+        try query.appendSlice(aa, ed);
+        try query.appendSlice(aa, "' + INTERVAL 45 DAY");
     }
 
     try query.appendSlice(aa, " ORDER BY date ASC");
@@ -2863,7 +2867,24 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
     }
 
     normalizeDailyBarVolumes(bars.items);
-    try writeDailyBarsArray(stream, allocator, bars.items);
+
+    var out = std.io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+
+    try s.beginArray();
+    for (bars.items) |bar| {
+        if (output_start_date) |sd| {
+            if (std.mem.order(u8, bar.date, sd) == .lt) continue;
+        }
+        if (output_end_date) |ed| {
+            if (std.mem.order(u8, bar.date, ed) == .gt) continue;
+        }
+        try writeDailyBarJsonObject(&s, bar);
+    }
+    try s.endArray();
+
+    try http.respond(stream, 200, out.written());
     return true;
 }
 
@@ -2879,30 +2900,38 @@ fn writeDailyBarsArray(stream: std.net.Stream, allocator: std.mem.Allocator, bar
     defer out.deinit();
 
     var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    try s.beginArray();
-    for (bars) |bar| {
-        try s.beginObject();
-        try s.objectField("date");
-        try s.write(bar.date);
-        try s.objectField("open");
-        try s.write(bar.open);
-        try s.objectField("close");
-        try s.write(bar.close);
-        try s.objectField("high");
-        try s.write(bar.high);
-        try s.objectField("low");
-        try s.write(bar.low);
-        try s.objectField("volume");
-        try s.write(bar.volume);
-        try s.objectField("amount");
-        try writeNullableF64(&s, bar.amount);
-        try s.objectField("change_pct");
-        try writeNullableF64(&s, bar.change_pct);
-        try s.endObject();
-    }
-    try s.endArray();
+    try writeDailyBarsJsonArray(&s, bars);
 
     try http.respond(stream, 200, out.written());
+}
+
+fn writeDailyBarJsonObject(s: *std.json.Stringify, bar: DailyBar) !void {
+    try s.beginObject();
+    try s.objectField("date");
+    try s.write(bar.date);
+    try s.objectField("open");
+    try s.write(bar.open);
+    try s.objectField("close");
+    try s.write(bar.close);
+    try s.objectField("high");
+    try s.write(bar.high);
+    try s.objectField("low");
+    try s.write(bar.low);
+    try s.objectField("volume");
+    try s.write(bar.volume);
+    try s.objectField("amount");
+    try writeNullableF64(s, bar.amount);
+    try s.objectField("change_pct");
+    try writeNullableF64(s, bar.change_pct);
+    try s.endObject();
+}
+
+fn writeDailyBarsJsonArray(s: *std.json.Stringify, bars: []const DailyBar) !void {
+    try s.beginArray();
+    for (bars) |bar| {
+        try writeDailyBarJsonObject(s, bar);
+    }
+    try s.endArray();
 }
 
 fn handle_price_history(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: []const u8, uri: []const u8, db: ?*duckdb.Db) !void {
@@ -3517,26 +3546,12 @@ fn handle_stock_full(allocator: std.mem.Allocator, stream: std.net.Stream, symbo
     try s.objectField("futures");
     try writeFuturesAnalysisObject(&s, allocator, info.industry orelse "");
 
+    const kline_bars = try dailyBarsFromKlineItems(allocator, kline_result.items);
+    defer freeDailyBars(allocator, kline_bars);
+
     // K-line as array
     try s.objectField("kline");
-    try s.beginArray();
-    for (kline_result.items) |kline| {
-        try s.beginObject();
-        try s.objectField("date");
-        try s.write(kline.date);
-        try s.objectField("open");
-        try s.write(kline.open);
-        try s.objectField("close");
-        try s.write(kline.close);
-        try s.objectField("high");
-        try s.write(kline.high);
-        try s.objectField("low");
-        try s.write(kline.low);
-        try s.objectField("volume");
-        try s.write(kline.volume);
-        try s.endObject();
-    }
-    try s.endArray();
+    try writeDailyBarsJsonArray(&s, kline_bars);
 
     try s.endObject();
 
