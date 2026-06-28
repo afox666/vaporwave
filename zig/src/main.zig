@@ -2071,6 +2071,111 @@ fn freeDailyBars(allocator: std.mem.Allocator, bars: []DailyBar) void {
     allocator.free(bars);
 }
 
+fn isPositiveFinite(v: f64) bool {
+    return std.math.isFinite(v) and v > 0;
+}
+
+fn detectedVolumeScale(bar: DailyBar) ?f64 {
+    if (!isPositiveFinite(bar.volume) or !isPositiveFinite(bar.close)) return null;
+    const amount = bar.amount orelse return null;
+    if (!isPositiveFinite(amount)) return null;
+
+    const implied_volume = amount / bar.close;
+    if (!isPositiveFinite(implied_volume)) return null;
+
+    const ratio = implied_volume / bar.volume;
+    if (ratio >= 50 and ratio <= 150) return 100;
+    if (ratio >= 0.5 and ratio <= 1.5) return 1;
+    return null;
+}
+
+fn shouldScaleVolumeFromNeighbor(volume: f64, neighbor_volume: f64) bool {
+    if (!isPositiveFinite(volume) or !isPositiveFinite(neighbor_volume)) return false;
+
+    const raw_ratio = neighbor_volume / volume;
+    const scaled_volume = volume * 100;
+    const scaled_ratio = scaled_volume / neighbor_volume;
+    return raw_ratio >= 20 and raw_ratio <= 200 and scaled_ratio >= 0.2 and scaled_ratio <= 5;
+}
+
+fn normalizeDailyBarVolumes(bars: []DailyBar) void {
+    if (bars.len == 0) return;
+
+    for (bars) |*bar| {
+        const scale = detectedVolumeScale(bar.*) orelse continue;
+        if (scale > 1.5) {
+            bar.volume *= scale;
+        }
+    }
+
+    var prev_volume: ?f64 = null;
+    for (bars) |*bar| {
+        if (!isPositiveFinite(bar.volume)) continue;
+        if (bar.amount == null) {
+            if (prev_volume) |prev| {
+                if (shouldScaleVolumeFromNeighbor(bar.volume, prev)) {
+                    bar.volume *= 100;
+                }
+            }
+        }
+        prev_volume = bar.volume;
+    }
+
+    var next_volume: ?f64 = null;
+    var idx = bars.len;
+    while (idx > 0) {
+        idx -= 1;
+        const bar = &bars[idx];
+        if (!isPositiveFinite(bar.volume)) continue;
+        if (bar.amount == null) {
+            if (next_volume) |next| {
+                if (shouldScaleVolumeFromNeighbor(bar.volume, next)) {
+                    bar.volume *= 100;
+                }
+            }
+        }
+        next_volume = bar.volume;
+    }
+}
+
+test "daily k volume normalization converts hand volume to shares" {
+    var bars = [_]DailyBar{
+        .{
+            .date = "2026-04-17",
+            .open = 14.88,
+            .close = 14.72,
+            .high = 14.95,
+            .low = 14.7,
+            .volume = 64111955,
+            .amount = 944973410,
+        },
+        .{
+            .date = "2026-04-20",
+            .open = 14.7,
+            .close = 14.58,
+            .high = 14.76,
+            .low = 14.55,
+            .volume = 727077,
+            .amount = null,
+        },
+        .{
+            .date = "2026-04-27",
+            .open = 14.4,
+            .close = 14.2,
+            .high = 14.43,
+            .low = 14.16,
+            .volume = 767752,
+            .amount = 1096333344,
+        },
+    };
+
+    normalizeDailyBarVolumes(bars[0..]);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 64111955), bars[0].volume, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 72707700), bars[1].volume, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 76775200), bars[2].volume, 0.01);
+}
+
 fn loadDailyBarsFromDb(allocator: std.mem.Allocator, d: *duckdb.Db, symbol: []const u8, limit: usize) ![]DailyBar {
     if (!isSafeSymbol(symbol)) return error.InvalidSymbol;
 
@@ -2115,7 +2220,9 @@ fn loadDailyBarsFromDb(allocator: std.mem.Allocator, d: *duckdb.Db, symbol: []co
         });
     }
 
-    return try bars.toOwnedSlice(allocator);
+    const owned = try bars.toOwnedSlice(allocator);
+    normalizeDailyBarVolumes(owned);
+    return owned;
 }
 
 fn loadDailyBars(allocator: std.mem.Allocator, db: ?*duckdb.Db, symbol: []const u8, limit: usize) ![]DailyBar {
@@ -2735,35 +2842,28 @@ fn writeDailyRowsFromDb(allocator: std.mem.Allocator, stream: std.net.Stream, d:
         return false;
     }
 
-    var out = std.io.Writer.Allocating.init(allocator);
-    defer out.deinit();
+    var bars = std.ArrayList(DailyBar){ .items = &.{}, .capacity = 0 };
+    defer {
+        for (bars.items) |bar| allocator.free(bar.date);
+        bars.deinit(allocator);
+    }
 
-    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    try s.beginArray();
     var r: usize = 0;
     while (r < result.rows.items.len) : (r += 1) {
-        try s.beginObject();
-        try s.objectField("date");
-        try s.write(result.getStr(r, "date") orelse "");
-        try s.objectField("open");
-        try writeNullableF64(&s, result.getF64(r, "open"));
-        try s.objectField("close");
-        try writeNullableF64(&s, result.getF64(r, "close"));
-        try s.objectField("high");
-        try writeNullableF64(&s, result.getF64(r, "high"));
-        try s.objectField("low");
-        try writeNullableF64(&s, result.getF64(r, "low"));
-        try s.objectField("volume");
-        try writeNullableF64(&s, result.getF64(r, "volume"));
-        try s.objectField("amount");
-        try writeNullableF64(&s, result.getF64(r, "amount"));
-        try s.objectField("change_pct");
-        try writeNullableF64(&s, result.getF64(r, "change_pct"));
-        try s.endObject();
+        try bars.append(allocator, DailyBar{
+            .date = try allocator.dupe(u8, result.getStr(r, "date") orelse ""),
+            .open = result.getF64(r, "open") orelse 0,
+            .close = result.getF64(r, "close") orelse 0,
+            .high = result.getF64(r, "high") orelse 0,
+            .low = result.getF64(r, "low") orelse 0,
+            .volume = result.getF64(r, "volume") orelse 0,
+            .amount = result.getF64(r, "amount"),
+            .change_pct = result.getF64(r, "change_pct"),
+        });
     }
-    try s.endArray();
 
-    try http.respond(stream, 200, out.written());
+    normalizeDailyBarVolumes(bars.items);
+    try writeDailyBarsArray(stream, allocator, bars.items);
     return true;
 }
 
@@ -2842,34 +2942,27 @@ fn handle_daily_k(allocator: std.mem.Allocator, stream: std.net.Stream, symbol: 
         return;
     }
 
-    var out = std.io.Writer.Allocating.init(allocator);
-    defer out.deinit();
-
-    var s = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    try s.beginArray();
-    for (result.items) |kline| {
-        try s.beginObject();
-        try s.objectField("date");
-        try s.write(kline.date);
-        try s.objectField("open");
-        try s.write(kline.open);
-        try s.objectField("close");
-        try s.write(kline.close);
-        try s.objectField("high");
-        try s.write(kline.high);
-        try s.objectField("low");
-        try s.write(kline.low);
-        try s.objectField("volume");
-        try s.write(kline.volume);
-        try s.objectField("amount");
-        try writeNullableF64(&s, kline.amount);
-        try s.objectField("change_pct");
-        try writeNullableF64(&s, kline.change_pct);
-        try s.endObject();
+    var bars = std.ArrayList(DailyBar){ .items = &.{}, .capacity = 0 };
+    defer {
+        for (bars.items) |bar| allocator.free(bar.date);
+        bars.deinit(allocator);
     }
-    try s.endArray();
 
-    try http.respond(stream, 200, out.written());
+    for (result.items) |kline| {
+        try bars.append(allocator, DailyBar{
+            .date = try allocator.dupe(u8, kline.date),
+            .open = kline.open,
+            .close = kline.close,
+            .high = kline.high,
+            .low = kline.low,
+            .volume = kline.volume,
+            .amount = kline.amount,
+            .change_pct = kline.change_pct,
+        });
+    }
+
+    normalizeDailyBarVolumes(bars.items);
+    try writeDailyBarsArray(stream, allocator, bars.items);
 }
 
 // ============================================================
